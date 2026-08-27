@@ -37,15 +37,23 @@ jobs:
             max-silent-time = 3600
 
       # The same targets garnix.yaml built: the per-GHC test suites and the
-      # flake checks.
-      - name: Build test suites
-        run: >
-          nix build
-          '.#hs-opentelemetry-suite-ghc94'
-          '.#hs-opentelemetry-suite-ghc96'
-          '.#hs-opentelemetry-suite-ghc98'
-          '.#hs-opentelemetry-suite-ghc910'
-          --print-build-logs
+      # flake checks. nix-fast-build writes per-target results to the
+      # GitHub step summary and retries transient failures.
+      - name: Build ghc94 suite
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#hs-opentelemetry-suite-ghc94'
+
+      - name: Build ghc96 suite
+        if: ${{ !cancelled() }}
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#hs-opentelemetry-suite-ghc96'
+
+      - name: Build ghc98 suite
+        if: ${{ !cancelled() }}
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#hs-opentelemetry-suite-ghc98'
+
+      - name: Build ghc910 suite
+        if: ${{ !cancelled() }}
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#hs-opentelemetry-suite-ghc910'
 
       - name: Run flake checks
-        run: nix build '.#checks.x86_64-linux.pre-commit-check' --print-build-logs
+        if: ${{ !cancelled() }}
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#checks.x86_64-linux.pre-commit-check'
