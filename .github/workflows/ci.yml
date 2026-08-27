@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & test (x86_64-linux)
+    runs-on: namespace-profile-mercury-oss-linux
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Mounts /nix from the Namespace cache volume; must run before Nix is
+      # installed so the store lands on the volume.
+      - name: Set up nix cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547 # v1.6.1
+        with:
+          cache: nix
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            extra-substituters = https://cache.iog.io https://devenv.cachix.org
+            extra-trusted-public-keys = hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ= devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=
+
+      # The same targets garnix.yaml built: the per-GHC test suites and the
+      # flake checks.
+      - name: Build test suites
+        run: >
+          nix build
+          '.#hs-opentelemetry-suite-ghc94'
+          '.#hs-opentelemetry-suite-ghc96'
+          '.#hs-opentelemetry-suite-ghc98'
+          '.#hs-opentelemetry-suite-ghc910'
+          --print-build-logs
+
+      - name: Run flake checks
+        run: nix build '.#checks.x86_64-linux.pre-commit-check' --print-build-logs
