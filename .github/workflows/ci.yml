@@ -17,6 +17,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # nix-eval-jobs fetches the repo as a git+file flake input and
+          # cannot compute a stable narHash from a shallow clone.
+          fetch-depth: 0
 
       # Mounts /nix from the Namespace cache volume; must run before Nix is
       # installed so the store lands on the volume.
