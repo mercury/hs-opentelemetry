@@ -40,24 +40,35 @@ jobs:
             # timeout: kill any derivation silent for an hour and name it.
             max-silent-time = 3600
 
+      # Resolve the flake to a store path once; nix-eval-jobs (inside
+      # nix-fast-build) bundles its own nix and disagrees with the
+      # installed nix about git+file narHashes, so evaluate from the
+      # store copy where git is out of the picture.
+      - name: Resolve flake to a store path
+        run: |
+          nix flake metadata --json > /tmp/flake-meta.json
+          FLAKE_PATH=$(grep -oE '"path":"/nix/store/[^"]+"' /tmp/flake-meta.json | head -1 | cut -d'"' -f4)
+          test -n "$FLAKE_PATH"
+          echo "FLAKE_PATH=$FLAKE_PATH" >> "$GITHUB_ENV"
+
       # The same targets garnix.yaml built: the per-GHC test suites and the
       # flake checks. nix-fast-build writes per-target results to the
       # GitHub step summary and retries transient failures.
       - name: Build ghc94 suite
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#hs-opentelemetry-suite-ghc94'
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc94"
 
       - name: Build ghc96 suite
         if: ${{ !cancelled() }}
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#hs-opentelemetry-suite-ghc96'
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc96"
 
       - name: Build ghc98 suite
         if: ${{ !cancelled() }}
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#hs-opentelemetry-suite-ghc98'
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc98"
 
       - name: Build ghc910 suite
         if: ${{ !cancelled() }}
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#hs-opentelemetry-suite-ghc910'
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc910"
 
       - name: Run flake checks
         if: ${{ !cancelled() }}
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake '.#checks.x86_64-linux.pre-commit-check'
+        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#checks.x86_64-linux.pre-commit-check"
