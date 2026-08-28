@@ -11,27 +11,8 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.name }} (x86_64-linux)
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: ghc94
-            attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc94
-          - name: ghc96
-            attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc96
-          - name: ghc98
-            attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc98
-          - name: ghc910
-            attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc910
-          - name: checks
-            attr: checks.x86_64-linux.pre-commit-check
-    # One cache volume per matrix entry: concurrent jobs sharing a volume
-    # fork it and commit last-write-wins, so a shared volume would keep
-    # all but one suite cold. The cache-tag override picks the volume;
-    # machine shape, cache size, and the only-main-may-commit protection
-    # stay governed by the profile in the Namespace dashboard.
-    runs-on: namespace-profile-mercury-oss-linux;overrides.cache-tag=hs-opentelemetry-nix-${{ matrix.name }}
+    name: Build & test (x86_64-linux)
+    runs-on: namespace-profile-mercury-oss-linux
     timeout-minutes: 240
     steps:
       - name: Checkout
@@ -42,7 +23,11 @@ jobs:
           fetch-depth: 0
 
       # Mounts /nix from the cache volume; must run before Nix is
-      # installed so the store lands on the volume.
+      # installed so the store lands on the volume. The suites build
+      # sequentially in one job on purpose: concurrent jobs would fork
+      # the repo's cache volume and commit last-write-wins, keeping all
+      # but one suite cold. Revisit as a matrix once per-job cache-tag
+      # overrides work on profile-based runners.
       - name: Set up nix cache
         uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547 # v1.6.1
         with:
@@ -59,7 +44,33 @@ jobs:
             # it, instead of letting a wedged build eat the whole job.
             max-silent-time = 1800
 
-      - name: Build
+      # The same targets garnix.yaml built: the per-GHC test suites and
+      # the flake checks.
+      - name: Build ghc94 suite
         uses: ./.github/actions/nix-fast-build
         with:
-          attr: ${{ matrix.attr }}
+          attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc94
+
+      - name: Build ghc96 suite
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc96
+
+      - name: Build ghc98 suite
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc98
+
+      - name: Build ghc910 suite
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc910
+
+      - name: Run flake checks
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: checks.x86_64-linux.pre-commit-check
