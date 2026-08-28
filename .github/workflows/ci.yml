@@ -28,13 +28,10 @@ jobs:
             attr: checks.x86_64-linux.pre-commit-check
     # One cache volume per matrix entry: concurrent jobs sharing a volume
     # fork it and commit last-write-wins, so a shared volume would keep
-    # all but one suite cold. Only main may commit snapshots; PR runs
-    # read the volume but their changes are discarded.
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
-      - nscloud-cache-tag-hs-opentelemetry-nix-${{ matrix.name }}
-      - nscloud-cache-size-50gb
-      - nscloud-cache-allow-commit-from-main
+    # all but one suite cold. The cache-tag override picks the volume;
+    # machine shape, cache size, and the only-main-may-commit protection
+    # stay governed by the profile in the Namespace dashboard.
+    runs-on: namespace-profile-mercury-oss-linux;overrides.cache-tag=hs-opentelemetry-nix-${{ matrix.name }}
     timeout-minutes: 240
     steps:
       - name: Checkout
