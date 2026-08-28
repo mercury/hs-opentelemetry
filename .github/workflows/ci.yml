@@ -11,9 +11,31 @@ concurrency:
 
 jobs:
   build:
-    name: Build & test (x86_64-linux)
-    runs-on: namespace-profile-mercury-oss-linux
-    timeout-minutes: 180
+    name: ${{ matrix.name }} (x86_64-linux)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ghc94
+            attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc94
+          - name: ghc96
+            attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc96
+          - name: ghc98
+            attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc98
+          - name: ghc910
+            attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc910
+          - name: checks
+            attr: checks.x86_64-linux.pre-commit-check
+    # One cache volume per matrix entry: concurrent jobs sharing a volume
+    # fork it and commit last-write-wins, so a shared volume would keep
+    # all but one suite cold. Only main may commit snapshots; PR runs
+    # read the volume but their changes are discarded.
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-hs-opentelemetry-nix-${{ matrix.name }}
+      - nscloud-cache-size-50gb
+      - nscloud-cache-allow-commit-from-main
+    timeout-minutes: 240
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -22,7 +44,7 @@ jobs:
           # cannot compute a stable narHash from a shallow clone.
           fetch-depth: 0
 
-      # Mounts /nix from the Namespace cache volume; must run before Nix is
+      # Mounts /nix from the cache volume; must run before Nix is
       # installed so the store lands on the volume.
       - name: Set up nix cache
         uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547 # v1.6.1
@@ -36,56 +58,11 @@ jobs:
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
             extra-substituters = https://cache.iog.io https://devenv.cachix.org
             extra-trusted-public-keys = hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ= devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=
-            # Fail loudly on hung builds instead of eating the whole job
-            # timeout: kill any derivation silent for 30 minutes and name it.
+            # Kill any derivation that is silent for 30 minutes and name
+            # it, instead of letting a wedged build eat the whole job.
             max-silent-time = 1800
 
-      # Resolve the flake to a store path once; nix-eval-jobs (inside
-      # nix-fast-build) bundles its own nix and disagrees with the
-      # installed nix about git+file narHashes, so evaluate from the
-      # store copy where git is out of the picture.
-      - name: Resolve flake to a store path
-        run: |
-          nix flake metadata --json > /tmp/flake-meta.json
-          FLAKE_PATH=$(grep -oE '"path":"/nix/store/[^"]+"' /tmp/flake-meta.json | head -1 | cut -d'"' -f4)
-          test -n "$FLAKE_PATH"
-          echo "FLAKE_PATH=$FLAKE_PATH" >> "$GITHUB_ENV"
-
-      # Builds intermittently wedge in fixupPhase on the runner (likely a
-      # cache-volume I/O stall); max-silent-time bounds each wedge at 30
-      # minutes and a retry redoes only the killed derivation, since
-      # everything else is already in the local store.
-      - name: Prepare build helper
-        run: |
-          cat > /tmp/nfb.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -uo pipefail
-          for attempt in 1 2 3; do
-            nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --flake "$1" && exit 0
-            echo "::warning::nix-fast-build attempt $attempt for $1 failed; retrying"
-          done
-          exit 1
-          EOF
-          chmod +x /tmp/nfb.sh
-
-      # The same targets garnix.yaml built: the per-GHC test suites and the
-      # flake checks. nix-fast-build writes per-target results to the
-      # GitHub step summary.
-      - name: Build ghc94 suite
-        run: /tmp/nfb.sh "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc94"
-
-      - name: Build ghc96 suite
-        if: ${{ !cancelled() }}
-        run: /tmp/nfb.sh "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc96"
-
-      - name: Build ghc98 suite
-        if: ${{ !cancelled() }}
-        run: /tmp/nfb.sh "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc98"
-
-      - name: Build ghc910 suite
-        if: ${{ !cancelled() }}
-        run: /tmp/nfb.sh "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc910"
-
-      - name: Run flake checks
-        if: ${{ !cancelled() }}
-        run: /tmp/nfb.sh "$FLAKE_PATH#checks.x86_64-linux.pre-commit-check"
+      - name: Build
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: ${{ matrix.attr }}

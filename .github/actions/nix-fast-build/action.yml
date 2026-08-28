@@ -1,0 +1,39 @@
+name: nix-fast-build
+description: >
+  Build one flake attribute with nix-fast-build, evaluating from a store-path
+  copy of the flake and retrying builds killed by max-silent-time.
+inputs:
+  attr:
+    description: Flake attribute to build, e.g. packages.x86_64-linux.foo
+    required: true
+  attempts:
+    description: Total build attempts before failing
+    required: false
+    default: "3"
+runs:
+  using: composite
+  steps:
+    # nix-eval-jobs (inside nix-fast-build) bundles its own nix, which can
+    # disagree with the installed nix about git+file narHashes; a store-path
+    # flake has no git metadata to disagree about.
+    - name: Resolve flake to a store path
+      shell: bash
+      run: |
+        nix flake metadata --json > "$RUNNER_TEMP/flake-meta.json"
+        FLAKE_PATH=$(grep -oE '"path":"/nix/store/[^"]+"' "$RUNNER_TEMP/flake-meta.json" | head -1 | cut -d'"' -f4)
+        test -n "$FLAKE_PATH"
+        echo "FLAKE_PATH=$FLAKE_PATH" >> "$GITHUB_ENV"
+
+    # Builds occasionally wedge in fixupPhase on cache-volume-backed runners;
+    # max-silent-time (set at nix install) bounds the wedge and a retry only
+    # redoes the killed derivation — the rest is already in the local store.
+    - name: Build ${{ inputs.attr }}
+      shell: bash
+      run: |
+        for attempt in $(seq 1 '${{ inputs.attempts }}'); do
+          nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- \
+            --no-nom --skip-cached \
+            --flake "${FLAKE_PATH}#${{ inputs.attr }}" && exit 0
+          echo "::warning::nix-fast-build attempt ${attempt} for ${{ inputs.attr }} failed; retrying"
+        done
+        exit 1
