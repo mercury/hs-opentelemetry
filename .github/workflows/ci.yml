@@ -37,8 +37,8 @@ jobs:
             extra-substituters = https://cache.iog.io https://devenv.cachix.org
             extra-trusted-public-keys = hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ= devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=
             # Fail loudly on hung builds instead of eating the whole job
-            # timeout: kill any derivation silent for an hour and name it.
-            max-silent-time = 3600
+            # timeout: kill any derivation silent for 30 minutes and name it.
+            max-silent-time = 1800
 
       # Resolve the flake to a store path once; nix-eval-jobs (inside
       # nix-fast-build) bundles its own nix and disagrees with the
@@ -51,24 +51,41 @@ jobs:
           test -n "$FLAKE_PATH"
           echo "FLAKE_PATH=$FLAKE_PATH" >> "$GITHUB_ENV"
 
+      # Builds intermittently wedge in fixupPhase on the runner (likely a
+      # cache-volume I/O stall); max-silent-time bounds each wedge at 30
+      # minutes and a retry redoes only the killed derivation, since
+      # everything else is already in the local store.
+      - name: Prepare build helper
+        run: |
+          cat > /tmp/nfb.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --flake "$1" && exit 0
+            echo "::warning::nix-fast-build attempt $attempt for $1 failed; retrying"
+          done
+          exit 1
+          EOF
+          chmod +x /tmp/nfb.sh
+
       # The same targets garnix.yaml built: the per-GHC test suites and the
       # flake checks. nix-fast-build writes per-target results to the
-      # GitHub step summary and retries transient failures.
+      # GitHub step summary.
       - name: Build ghc94 suite
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc94"
+        run: /tmp/nfb.sh "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc94"
 
       - name: Build ghc96 suite
         if: ${{ !cancelled() }}
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc96"
+        run: /tmp/nfb.sh "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc96"
 
       - name: Build ghc98 suite
         if: ${{ !cancelled() }}
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc98"
+        run: /tmp/nfb.sh "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc98"
 
       - name: Build ghc910 suite
         if: ${{ !cancelled() }}
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc910"
+        run: /tmp/nfb.sh "$FLAKE_PATH#packages.x86_64-linux.hs-opentelemetry-suite-ghc910"
 
       - name: Run flake checks
         if: ${{ !cancelled() }}
-        run: nix run 'github:Mic92/nix-fast-build/807539facae08bede14d1ad258b4003721252e79' -- --no-nom --skip-cached --retries 2 --flake "$FLAKE_PATH#checks.x86_64-linux.pre-commit-check"
+        run: /tmp/nfb.sh "$FLAKE_PATH#checks.x86_64-linux.pre-commit-check"
