@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & test (x86_64-linux)
+    runs-on: namespace-profile-mercury-oss-linux
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # nix-eval-jobs fetches the repo as a git+file flake input and
+          # cannot compute a stable narHash from a shallow clone.
+          fetch-depth: 0
+
+      # Mounts /nix from the cache volume; must run before Nix is
+      # installed so the store lands on the volume. The suites build
+      # sequentially in one job on purpose: concurrent jobs would fork
+      # the repo's cache volume and commit last-write-wins, keeping all
+      # but one suite cold. Revisit as a matrix once per-job cache-tag
+      # overrides work on profile-based runners.
+      - name: Set up nix cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547 # v1.6.1
+        with:
+          cache: nix
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            extra-substituters = https://cache.iog.io https://devenv.cachix.org
+            extra-trusted-public-keys = hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ= devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=
+            # Kill any derivation that is silent for 30 minutes and name
+            # it, instead of letting a wedged build eat the whole job.
+            max-silent-time = 1800
+
+      # The same targets garnix.yaml built: the per-GHC test suites and
+      # the flake checks.
+      - name: Build ghc94 suite
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc94
+
+      - name: Build ghc96 suite
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc96
+
+      - name: Build ghc98 suite
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc98
+
+      - name: Build ghc910 suite
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: packages.x86_64-linux.hs-opentelemetry-suite-ghc910
+
+      - name: Run flake checks
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/nix-fast-build
+        with:
+          attr: checks.x86_64-linux.pre-commit-check

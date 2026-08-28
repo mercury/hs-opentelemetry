@@ -153,12 +153,10 @@
     # but remove it here if you do not want it to.
     extra-substituters = [
       "https://cache.iog.io"
-      "https://cache.garnix.io"
       "https://devenv.cachix.org"
     ];
     extra-trusted-public-keys = [
       "hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ="
-      "cache.garnix.io:CTFPyKSLcx5RMJKfLo5EEPUObbA78b0YQ2DTCJXqr9g="
       "devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw="
     ];
     allow-import-from-derivation = "true";
