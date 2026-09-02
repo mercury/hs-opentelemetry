@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Performance
+- **`createSpan` no longer builds `code.*` attributes for Dropped spans.**
+  Source-location attributes are now passed lazily, as `inSpan` already did.
+  `createSpan` on a no-op tracer went from 168 ns / 815 B to 10 ns / 0 B.
+  The `withFrozenCallStack` opt-out is preserved.
+- **Batch attribute merges use structural sharing.** `addAttributes`
+  previously inserted every key of the batch one at a time into the live
+  map, so it was O(n log n) with a path copy per key even onto an empty
+  base. It now merges with `HashMap.union` and only falls back to the
+  per-key path when a batch actually crosses the count limit. Adding 100
+  pre-built attributes to a span went from 4.5 µs / 41 KB to 0.42 µs /
+  1.3 KB; 20 attributes from 851 ns to 195 ns. Event and link attributes
+  take the same path.
+- **New `OpenTelemetry.Attributes.addAttributeMap`**: monomorphic variant
+  of `addAttributes` for values that are already `Attribute`s. Skips the
+  `toAttribute` conversion pass. `addAttributes`, `addEvent`, and links in
+  `OpenTelemetry.Trace.Core` use it.
+- **`addAttributesFromBuilder` materialises the batch first and merges.**
+  About 25% cheaper at 10 to 100 attributes, and a static builder at a
+  call site can now be floated out as a constant map.
+- Added 10, 20, and 100 attribute cases to the API benchmark for
+  sequential `addAttribute`, batch `addAttributes`, `addAttributes'`,
+  `createSpan` with initial attributes, and the pure `Attributes`
+  operations.
+
 ## 1.0.0.0 - 2026-05-29
 
 ### Full Spec conformance against 1.55.0

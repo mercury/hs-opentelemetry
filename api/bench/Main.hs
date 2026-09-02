@@ -4,7 +4,8 @@
 
 module Main (main) where
 
-import Control.Monad (void)
+import Control.Exception (evaluate)
+import Control.Monad (forM_, void)
 import qualified Data.HashMap.Strict as H
 import Data.IORef
 import qualified Data.Text as T
@@ -38,6 +39,18 @@ main = do
   let activeTracer = makeTracer activeTp (InstrumentationLibrary "bench" "1.0" "" emptyAttributes) tracerOptions
 
   calibRef <- newIORef ()
+
+  -- Pre-built inputs for the larger attribute counts, so those benchmarks
+  -- measure the span or Attributes operation and not list construction.
+  map10 <- evaluate $ mkAttrMap 10
+  map20 <- evaluate $ mkAttrMap 20
+  map100 <- evaluate $ mkAttrMap 100
+  let builder10 = mkAttrBuilder 10
+      builder20 = mkAttrBuilder 20
+      builder100 = mkAttrBuilder 100
+  keys10 <- evaluate $ mkKeys 10
+  keys20 <- evaluate $ mkKeys 20
+  keys100 <- evaluate $ mkKeys 100
 
   defaultMain
     [ bgroup
@@ -99,6 +112,13 @@ main = do
             addAttribute s "k8" ("v" :: T.Text)
             addAttribute s "k9" ("v" :: T.Text)
             addAttribute s "k10" ("v" :: T.Text)
+        , -- One CAS and one HashMap insert per attribute, on a growing map.
+          bench "on live span (20 attrs sequential)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            forM_ keys20 $ \k -> addAttribute s k ("v" :: T.Text)
+        , bench "on live span (100 attrs sequential)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            forM_ keys100 $ \k -> addAttribute s k ("v" :: T.Text)
         ]
     , bgroup
         "addAttributes-batch"
@@ -144,6 +164,42 @@ main = do
               A.attr "method" ("GET" :: T.Text)
                 <> A.attr "url" ("https://example.com/api" :: T.Text)
                 <> A.attr "status" (200 :: Int)
+        , -- Pre-built inputs from here on: measures the merge into the span.
+          bench "H.fromList 10 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes s map10
+        , bench "H.fromList 20 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes s map20
+        , bench "H.fromList 100 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes s map100
+        , bench "AttrsBuilder 10 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes' s builder10
+        , bench "AttrsBuilder 20 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes' s builder20
+        , bench "AttrsBuilder 100 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes' s builder100
+        ]
+    , bgroup
+        "createSpan-initial-attrs"
+        -- Attributes supplied in SpanArguments go through unsafeAttributesFromMap
+        -- plus the thread.id insert at creation time.
+        [ bench "10 attrs" $
+            whnfIO $
+              createSpan activeTracer empty "s" defaultSpanArguments {attributes = map10}
+        , bench "20 attrs" $
+            whnfIO $
+              createSpan activeTracer empty "s" defaultSpanArguments {attributes = map20}
+        , bench "100 attrs" $
+            whnfIO $
+              createSpan activeTracer empty "s" defaultSpanArguments {attributes = map100}
+        , bench "100 attrs, Dropped (no processors)" $
+            whnfIO $
+              createSpan noopTracer empty "s" defaultSpanArguments {attributes = map100}
         ]
     , bgroup
         "Attributes-pure"
@@ -194,6 +250,22 @@ main = do
                     )
               )
               emptyAttributes
+        , bench "addAttribute x20 (distinct keys, pre-built)" $
+            whnf (\ks -> foldl (\acc k -> A.addAttribute defaultAttributeLimits acc k ("v" :: T.Text)) emptyAttributes ks) keys20
+        , bench "addAttribute x100 (distinct keys, pre-built)" $
+            whnf (\ks -> foldl (\acc k -> A.addAttribute defaultAttributeLimits acc k ("v" :: T.Text)) emptyAttributes ks) keys100
+        , bench "addAttributes (HashMap) x20" $
+            whnf (A.addAttributes defaultAttributeLimits emptyAttributes) map20
+        , bench "addAttributes (HashMap) x100" $
+            whnf (A.addAttributes defaultAttributeLimits emptyAttributes) map100
+        , bench "unsafeAttributesFromMap x100" $
+            whnf (A.unsafeAttributesFromMap defaultAttributeLimits) map100
+        , bench "addAttributesFromBuilder x100" $
+            whnf (A.addAttributesFromBuilder defaultAttributeLimits emptyAttributes) builder100
+        , -- 100 existing + 100 new distinct keys: crosses the default limit of
+          -- 128, so 72 of the new keys are dropped and counted.
+          bench "addAttributes (HashMap) x100 onto 100 (hits limit)" $
+            whnf (A.addAttributes defaultAttributeLimits (A.unsafeAttributesFromMap defaultAttributeLimits map100)) (mkAttrMapFrom 101 100)
         ]
     , bgroup
         "context"
@@ -305,6 +377,25 @@ main = do
               newTraceAndSpanId DefaultIdGenerator
         ]
     ]
+
+
+mkKeys :: Int -> [T.Text]
+mkKeys n = [T.pack ("k" <> show i) | i <- [1 .. n]]
+
+
+-- | @n@ distinct text attributes @k1=v1 .. kN=vN@ as a plain map.
+mkAttrMap :: Int -> A.AttributeMap
+mkAttrMap = mkAttrMapFrom 1
+
+
+-- | @n@ distinct text attributes with keys starting at @kStart@.
+mkAttrMapFrom :: Int -> Int -> A.AttributeMap
+mkAttrMapFrom start n =
+  H.fromList [(T.pack ("k" <> show i), A.toAttribute (T.pack ("v" <> show i))) | i <- [start .. start + n - 1]]
+
+
+mkAttrBuilder :: Int -> A.AttrsBuilder
+mkAttrBuilder n = mconcat [A.attr (T.pack ("k" <> show i)) (T.pack ("v" <> show i)) | i <- [1 .. n]]
 
 
 mkCountingProcessor :: IO SpanProcessor

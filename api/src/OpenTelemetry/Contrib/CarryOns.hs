@@ -58,7 +58,7 @@ withCarryOnProcessor p =
             atomicModifyIORef' (spanHot imm) $ \h ->
               ( h
                   { hotAttributes =
-                      Attributes.addAttributes
+                      Attributes.addAttributeMap
                         (tracerProviderAttributeLimits $ tracerProvider $ spanTracer imm)
                         (hotAttributes h)
                         carryOns
