@@ -335,8 +335,8 @@ createSpan
   -}
 createSpan t ctxt n args = liftIO $ do
   !tidInt <- getCurrentThreadId
-  -- Pass the source-location attributes lazily, as 'inSpan' does, so a
-  -- Dropped span never pays for building them.
+  -- The source-location attributes are lazy, as in 'inSpan'. A Dropped span
+  -- does not build them.
   let opt = codeOption $ unsafePerformIO getSemanticsOptions
       codeAttrs = if hasCodeAttributes (attributes args) then H.empty else createSpanCodeAttrs opt callStack
   createSpanHelper t ctxt n args codeAttrs tidInt
@@ -345,10 +345,10 @@ createSpan t ctxt n args = liftIO $ do
 
 {- | Source-location attributes for 'createSpan'.
 
-Mirrors the behaviour 'callerAttributes' had when it was called eagerly
-from 'createSpan': the top frame must be our own @createSpan@ frame.  Under
-'GHC.Stack.withFrozenCallStack' that frame is never pushed, and the result
-is empty, which is the documented way to opt out of automatic @code.*@
+The top frame of the stack must be the @createSpan@ frame. This is the same
+rule that 'callerAttributes' applied when 'createSpan' called it directly.
+'GHC.Stack.withFrozenCallStack' does not push that frame, so the result is
+empty. That is the documented way to turn off the automatic @code.*@
 attributes.
 -}
 createSpanCodeAttrs :: StabilityOpt -> CallStack -> AttributeMap
@@ -773,10 +773,10 @@ addAttribute (Dropped _) _ _ = pure ()
 
 {- | Add several attributes to a span in one update.
 
-This is one compare-and-swap on the span and one structural merge of the
-map, so it is much cheaper than a sequence of 'addAttribute' calls: about
-10x cheaper at 20 attributes and 15x at 100.  Prefer it whenever the
-attributes are already available as a map.
+This function does one compare-and-swap on the span and one merge of the
+map. A sequence of 'addAttribute' calls costs about 10 times more at 20
+attributes and 15 times more at 100. Use this function when the attributes
+are already in a map.
 
  @since 0.0.1.0
 -}
@@ -802,10 +802,10 @@ addAttributes (Dropped _) _ = pure ()
 
 {- | Like 'addAttributes', but takes an 'A.AttrsBuilder' instead of a 'HashMap'.
 
-Use this when the attributes come from typed keys or are optional.  For a
-handful of attributes the cost is the same as 'addAttributes'; for large
-batches a pre-built map passed to 'addAttributes' is faster because the
-builder still materialises one key at a time.
+Use this function when the attributes come from typed keys or are optional.
+For up to about 5 attributes the cost is the same as 'addAttributes'. For
+larger batches, 'addAttributes' with a prepared map is faster, because the
+builder inserts one key at a time.
 
 With typed 'AttributeKey's from semantic conventions:
 

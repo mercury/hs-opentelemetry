@@ -3,29 +3,29 @@
 ## Unreleased
 
 ### Performance
-- **`createSpan` no longer builds `code.*` attributes for Dropped spans.**
-  Source-location attributes are now passed lazily, as `inSpan` already did.
-  `createSpan` on a no-op tracer went from 168 ns / 815 B to 10 ns / 0 B.
-  The `withFrozenCallStack` opt-out is preserved.
-- **Batch attribute merges use structural sharing.** `addAttributes`
-  previously inserted every key of the batch one at a time into the live
-  map, so it was O(n log n) with a path copy per key even onto an empty
-  base. It now merges with `HashMap.union` and only falls back to the
-  per-key path when a batch actually crosses the count limit. Adding 100
-  pre-built attributes to a span went from 4.5 µs / 41 KB to 0.42 µs /
-  1.3 KB; 20 attributes from 851 ns to 195 ns. Event and link attributes
-  take the same path.
-- **New `OpenTelemetry.Attributes.addAttributeMap`**: monomorphic variant
-  of `addAttributes` for values that are already `Attribute`s. Skips the
-  `toAttribute` conversion pass. `addAttributes`, `addEvent`, and links in
-  `OpenTelemetry.Trace.Core` use it.
-- **`addAttributesFromBuilder` materialises the batch first and merges.**
-  About 25% cheaper at 10 to 100 attributes, and a static builder at a
-  call site can now be floated out as a constant map.
-- Added 10, 20, and 100 attribute cases to the API benchmark for
-  sequential `addAttribute`, batch `addAttributes`, `addAttributes'`,
-  `createSpan` with initial attributes, and the pure `Attributes`
-  operations.
+- `createSpan` does not build the `code.*` attributes for a Dropped span.
+  The source-location attributes are now lazy, as they are in `inSpan`.
+  `createSpan` on a no-op tracer went from 168 ns and 815 B to 10 ns and
+  0 B. The `withFrozenCallStack` opt-out still works.
+- `addAttributes` merges the batch with `HashMap.union`. Before, it inserted
+  each key of the batch into the live map one at a time. That was O(n log n)
+  and copied a path through the map for each key, also when the base map was
+  empty. The per-key path now runs only when the batch does not fit under the
+  count limit. To add 100 prepared attributes to a span went from 4.5 µs and
+  41 KB to 0.42 µs and 1.3 KB. For 20 attributes it went from 851 ns to
+  195 ns. Event attributes and link attributes take the same path.
+- New function `OpenTelemetry.Attributes.addAttributeMap`. It is
+  `addAttributes` for values that are already `Attribute`s, without the
+  `toAttribute` conversion pass. The span-level `addAttributes` in
+  `OpenTelemetry.Trace.Core` uses it, and so do `addEvent` and the link
+  code.
+- `addAttributesFromBuilder` builds the batch as a small map and then merges
+  it. This is about 25% cheaper from 10 to 100 attributes. GHC can also float
+  a static builder out of a call site as a constant map.
+- The API benchmark has new cases at 10, 20 and 100 attributes. They cover
+  sequential `addAttribute` calls, batch `addAttributes` calls, the
+  `addAttributes'` builder path, `createSpan` with initial attributes, and
+  the pure `Attributes` functions.
 
 ## 1.0.0.0 - 2026-05-29
 

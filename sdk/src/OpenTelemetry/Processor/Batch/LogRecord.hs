@@ -43,9 +43,10 @@ defaultBatchLogRecordProcessorConfig e =
     }
 
 
-{- | Log records waiting for export, newest first.  See the matching
-'Pending' type in "OpenTelemetry.Processor.Batch.Span" for why the
-producer side is a plain cons list behind an evaluated-value CAS.
+{- | Log records that wait for export, newest first.
+
+See the 'Pending' type in "OpenTelemetry.Processor.Batch.Span" for the
+reason this is a plain list behind an evaluated-value compare-and-swap.
 -}
 data Pending = Pending
   { pendingCount :: {-# UNPACK #-} !Int
@@ -57,7 +58,7 @@ emptyPending :: Pending
 emptyPending = Pending 0 []
 
 
--- | Returns the queue depth after the push, or 'Nothing' if dropped.
+-- | Returns the queue depth after the push, or 'Nothing' if the record was dropped.
 pushPending :: Int -> ReadableLogRecord -> IORef Pending -> IO (Maybe Int)
 pushPending bound lr ref = do
   old <- casReadModifyIORef_ ref $ \p@(Pending n xs) ->
@@ -66,7 +67,7 @@ pushPending bound lr ref = do
   pure $! if n >= bound then Nothing else Just (n + 1)
 
 
--- | Atomically take everything pending, oldest first.
+-- | Take all pending records, oldest first, and make the queue empty, in one atomic step.
 drainPending :: IORef Pending -> IO (Vector ReadableLogRecord)
 drainPending ref = do
   p <- casReadModifyIORef_ ref (const emptyPending)

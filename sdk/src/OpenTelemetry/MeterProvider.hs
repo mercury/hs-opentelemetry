@@ -179,10 +179,12 @@ data InstrumentDims = InstrumentDims
   deriving anyclass (Hashable)
 
 
-{- | Series key.  The instrument half is wrapped in 'Hashed' so its hash
-(over the scope, name, unit, description, histogram bounds and export key
-set) is computed once when the instrument is created rather than on every
-record.  Only the 'Attributes' half is hashed per record.
+{- | Series key.
+
+The instrument half is wrapped in 'Hashed'. Its hash covers the scope, the
+name, the unit, the description, the histogram bounds, and the export key
+set. The hash is computed one time, when the instrument is created. Each
+record hashes only the 'Attributes' half.
 -}
 type DimKey = (Hashed InstrumentDims, Attributes)
 
@@ -196,9 +198,9 @@ data SumCell = SumCell
 
 {- | Explicit-bucket histogram cell.
 
-@hcBuckets@ is unboxed so that 'VU.accum' stores an evaluated count.  A
-boxed vector would leave an @old + 1@ thunk in the bucket on every record
-and the chain would only be forced at collection time.
+@hcBuckets@ is an unboxed vector, so 'VU.accum' stores an evaluated count.
+A boxed vector stores an @old + 1@ thunk in the bucket on each record. That
+chain of thunks is forced only at collection time.
 -}
 data HistCell = HistCell
   { hcBuckets :: !(VU.Vector Word64)
@@ -264,12 +266,14 @@ bumpSeriesCount dims sc =
   in H.insert dims (n + 1) sc
 
 
-{- | Insert or update the cell for a series, honouring the per-instrument
-cardinality limit.  When the limit would be exceeded the update is routed
-to the instrument's overflow series instead.
+{- | Insert or update the cell for a series.
 
-The common case (series already exists) is a single 'H.alterF' traversal.
-A new series costs one extra lookup in the series-count map.
+The per-instrument cardinality limit applies. When the instrument is at
+the limit and the series is new, the update goes to the overflow series of
+the instrument.
+
+If the series exists, the cost is one 'H.alterF' traversal. A new series
+also does one lookup in the series-count map.
 -}
 upsertCell :: Int -> DimKey -> (Maybe Cell -> Cell) -> SdkMeterStorageState -> SdkMeterStorageState
 upsertCell lim k@(dims, _) mk st =
@@ -280,8 +284,8 @@ upsertCell lim k@(dims, _) mk st =
          if lim <= 0 || H.lookupDefault 0 dims (seriesCountByDims st) < lim
            then SdkMeterStorageState m' (bumpSeriesCount dims (seriesCountByDims st))
            else
-             -- Over the limit: discard the speculative insert and fold the
-             -- update into the overflow series.
+             -- The count is above the limit. Discard the insert above and
+             -- apply the update to the overflow series.
              let ok = overflowKey dims
                  (isNewOverflow, mo) = H.alterF (\old -> (isNothingCell old, Just $! mk old)) ok (storageCells st)
                  sc' = if isNewOverflow then bumpSeriesCount dims (seriesCountByDims st) else seriesCountByDims st
@@ -398,8 +402,8 @@ expHistToDataPoint startT t attrs ehc =
        }
 
 
--- The strict application matters: a strict @Maybe@ field only forces the
--- @Just@, not the comparison inside it.
+-- A strict @Maybe@ field forces only the @Just@. The @$!@ forces the
+-- comparison inside it.
 minMaybe :: Maybe Double -> Double -> Maybe Double
 minMaybe Nothing v = Just v
 minMaybe (Just a) v = Just $! min a v
@@ -606,19 +610,20 @@ addSumDbl delta isMonotonic mExVal k ref lim exOpts = do
 
 {- | Apply a pure update to the shared storage state.
 
-Uses an evaluated-value CAS ('casModifyIORef_') rather than
-'atomicModifyIORef''.  The latter installs a thunk and forces it after the
-swap, so concurrent recorders end up blocking on each other's blackholes;
-with an evaluated value, losers simply retry.
+The update goes through 'casModifyIORef_', which stores an evaluated value
+and retries when the swap fails. The alternative, 'atomicModifyIORef'',
+stores a thunk and forces it after the swap. Under contention each thread
+then has to wait for the thunk of the previous thread before it can
+continue.
 -}
 modifyStorage :: IORef SdkMeterStorageState -> (SdkMeterStorageState -> SdkMeterStorageState) -> IO ()
 modifyStorage = casModifyIORef_
 {-# INLINE modifyStorage #-}
 
 
--- Strict in the sum: @scValue@ is a strict field, but that only forces the
--- 'Left'/'Right' constructor.  Without @$!@ every add extends a thunk chain
--- that lives until the next collection.
+-- @scValue@ is a strict field, but that forces only the 'Left' or 'Right'
+-- constructor. The @$!@ forces the sum. Without it, each add extends a
+-- chain of thunks that lives until the next collection.
 addEither :: Either Int64 Double -> Either Int64 Double -> Either Int64 Double
 addEither (Left a) (Left b) = Left $! a + b
 addEither (Left a) (Right b) = Right $! fromIntegral a + b

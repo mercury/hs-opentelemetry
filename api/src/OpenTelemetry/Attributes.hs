@@ -224,10 +224,10 @@ addAttributeByKey limits attrs (AttributeKey k) v = addAttribute limits attrs k 
   #-}
 
 
-{- | Add a batch of attributes, converting each value with 'toAttribute'.
+{- | Add a batch of attributes. Each value is converted with 'toAttribute'.
 
-When the values are already 'Attribute's prefer 'addAttributeMap', which
-skips the conversion pass.
+If the values are already 'Attribute's, use 'addAttributeMap'. It does not
+do the conversion pass.
 
 @since 0.0.1.0
 -}
@@ -242,13 +242,13 @@ addAttributes limits@AttributeLimits {..} base attrs
 {-# INLINE addAttributes #-}
 
 
-{- | Add a batch of already-converted attributes.
+{- | Add a batch of attributes that are already 'Attribute's.
 
-This is the fast path for span, event, and link attributes.  The batch is
-merged with structural sharing ('H.union') instead of one insert per key,
-and a batch onto an empty base reuses the input map outright.  The per-key
-fold is only used when a batch actually crosses the count limit, so the
-exact drop semantics at the limit are unchanged.
+The span, event, and link code in "OpenTelemetry.Trace.Core" uses this
+function. The batch is merged with 'H.union', so the two maps share
+structure, and a batch that is added to an empty base becomes the new map.
+The per-key fold runs only when the result would be above the count limit,
+so the drop rules at the limit do not change.
 
 @since 1.0.1.0
 -}
@@ -263,19 +263,19 @@ addAttributeMap limits@AttributeLimits {..} base attrs
 {-# INLINE addAttributeMap #-}
 
 
--- Values in @attrs@ already have the length limit applied.
+-- The length limit is already applied to the values in @attrs@.
 mergeConverted :: AttributeLimits -> Attributes -> Map.AttributeMap -> Attributes
 mergeConverted AttributeLimits {..} Attributes {..} attrs
   | H.null attributeMap =
-      -- Fresh base: the batch becomes the map.  Only the count limit can
-      -- still apply, and any previously accumulated drop count carries over.
+      -- The base is empty, so the batch becomes the map. Only the count
+      -- limit applies here. The drop count from the base is kept.
       let !sz = H.size attrs
       in case attributeCountLimit of
            Just limit_
              | sz > limit_ -> slowMerge limit_
            _ -> Attributes attrs sz attributesDropped
   | otherwise =
-      -- Left-biased union: new values win on key collision, as with insert.
+      -- New values replace old values for the same key, as 'H.insert' does.
       let !merged = H.union attrs attributeMap
           !newCount = H.size merged
       in case attributeCountLimit of
@@ -283,9 +283,9 @@ mergeConverted AttributeLimits {..} Attributes {..} attrs
              | newCount > limit_ -> slowMerge limit_
            _ -> Attributes merged newCount attributesDropped
   where
-    -- Per-key path, used only when the batch crosses the count limit.
-    -- Existing keys are replaced in place; new keys are admitted until the
-    -- limit is reached and counted as dropped after that.
+    -- Per-key path for a batch that does not fit under the count limit.
+    -- Existing keys are replaced. New keys are added while the count is
+    -- below the limit, and the rest are counted as dropped.
     slowMerge limit_ =
       let (!merged, !accepted, !totalNew) =
             H.foldlWithKey'
@@ -312,9 +312,9 @@ an intermediate collection.
 -}
 addAttributesFromBuilder :: AttributeLimits -> Attributes -> AttrsBuilder -> Attributes
 addAttributesFromBuilder limits base builder =
-  -- Materialising the batch into its own small map and then merging is
-  -- cheaper than inserting each key into the (larger) live map, because
-  -- every insert into the live map copies a path through it.
+  -- Build the batch as a small map, then merge it. Each insert into the
+  -- live map copies a path through that map, so one merge is cheaper than
+  -- one insert per key.
   addAttributeMap limits base (buildAttrs builder)
 {-# INLINE addAttributesFromBuilder #-}
 

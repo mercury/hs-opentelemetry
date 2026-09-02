@@ -166,13 +166,13 @@ will be incremented.
 --   -- TODO slice and freeze appropriate section
 -- M.slice (gbSectionSize * (r .&. gbSectionMask)
 
-{- | Spans waiting for export, newest first.
+{- | Spans that wait for export, newest first.
 
-The producer side (every 'endSpan' on every request thread) only conses
-onto this list and bumps the count.  Grouping by instrumentation scope
-happens on the single worker thread in 'groupByScope', so the
-compare-and-swap window on the hot path is one small allocation and does
-not hash 'InstrumentationLibrary'.
+Each 'endSpan' adds one span to the front of this list and increments the
+count. That is all the request thread does. The worker thread groups the
+spans by instrumentation scope in 'groupByScope'. The compare-and-swap on
+the request thread is one small allocation and does not hash
+'InstrumentationLibrary'.
 -}
 data Pending = Pending
   { pendingCount :: {-# UNPACK #-} !Int
@@ -184,12 +184,15 @@ emptyPending :: Pending
 emptyPending = Pending 0 []
 
 
-{- | Push a span unless the queue is at capacity.  Returns the queue
-depth after the push, or 'Nothing' when the span was dropped.
+{- | Push a span, unless the queue is full.
 
-Uses an evaluated-value CAS rather than 'atomicModifyIORef'', which
-installs a thunk and makes concurrent callers block on each other's
-blackholes.  Under contention losers simply retry a very cheap step.
+Returns the queue depth after the push, or 'Nothing' if the span was
+dropped.
+
+The push goes through 'casReadModifyIORef_', which stores an evaluated
+value and retries when the swap fails. See 'modifyStorage' in
+"OpenTelemetry.MeterProvider" for the reason 'atomicModifyIORef'' is
+avoided on this path.
 -}
 pushPending :: Int -> ImmutableSpan -> IORef Pending -> IO (Maybe Int)
 pushPending bound s ref = do
@@ -199,13 +202,15 @@ pushPending bound s ref = do
   pure $! if n >= bound then Nothing else Just (n + 1)
 
 
--- | Atomically take everything that is pending and reset the queue.
+-- | Take all pending spans and make the queue empty, in one atomic step.
 drainPending :: IORef Pending -> IO [ImmutableSpan]
 drainPending ref = pendingSpans <$> casReadModifyIORef_ ref (const emptyPending)
 
 
-{- | Group a newest-first span list by instrumentation scope, preserving
-chronological order within each scope.  Runs on the worker thread only.
+{- | Group a newest-first span list by instrumentation scope.
+
+Spans in each group are in chronological order. Only the worker thread
+calls this function.
 -}
 groupByScope :: [ImmutableSpan] -> HashMap InstrumentationLibrary (Vector ImmutableSpan)
 groupByScope spans =
@@ -347,9 +352,9 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
               warnOnDrop droppedRef warnedRef maxQueueSize "BatchSpanProcessor"
               void $ atomically $ tryPutTMVar workSignal ()
             Just depth ->
-              -- Wake the worker once per full batch rather than on every
-              -- span past the threshold; the STM transaction is far more
-              -- expensive than the push itself and touches a shared TVar.
+              -- Wake the worker one time per full batch. The STM transaction
+              -- costs more than the push and writes to a shared TVar, so a
+              -- wake on each span above the batch size is too expensive.
               when (depth `rem` maxExportBatchSize == 0) $
                 void $
                   atomically $

@@ -40,8 +40,8 @@ main = do
 
   calibRef <- newIORef ()
 
-  -- Pre-built inputs for the larger attribute counts, so those benchmarks
-  -- measure the span or Attributes operation and not list construction.
+  -- The inputs for the larger attribute counts are built here, one time.
+  -- The benchmarks then measure only the span or Attributes operation.
   map10 <- evaluate $ mkAttrMap 10
   map20 <- evaluate $ mkAttrMap 20
   map100 <- evaluate $ mkAttrMap 100
@@ -112,7 +112,7 @@ main = do
             addAttribute s "k8" ("v" :: T.Text)
             addAttribute s "k9" ("v" :: T.Text)
             addAttribute s "k10" ("v" :: T.Text)
-        , -- One CAS and one HashMap insert per attribute, on a growing map.
+        , -- Each attribute costs one CAS and one insert into a map that grows.
           bench "on live span (20 attrs sequential)" $ whnfIO $ do
             s <- createSpan activeTracer empty "s" defaultSpanArguments
             forM_ keys20 $ \k -> addAttribute s k ("v" :: T.Text)
@@ -164,7 +164,7 @@ main = do
               A.attr "method" ("GET" :: T.Text)
                 <> A.attr "url" ("https://example.com/api" :: T.Text)
                 <> A.attr "status" (200 :: Int)
-        , -- Pre-built inputs from here on: measures the merge into the span.
+        , -- The inputs below are prepared. These cases measure the merge into the span.
           bench "H.fromList 10 attrs (pre-built)" $ whnfIO $ do
             s <- createSpan activeTracer empty "s" defaultSpanArguments
             addAttributes s map10
@@ -186,8 +186,8 @@ main = do
         ]
     , bgroup
         "createSpan-initial-attrs"
-        -- Attributes supplied in SpanArguments go through unsafeAttributesFromMap
-        -- plus the thread.id insert at creation time.
+        -- Attributes in SpanArguments go through unsafeAttributesFromMap and
+        -- one insert for thread.id when the span is created.
         [ bench "10 attrs" $
             whnfIO $
               createSpan activeTracer empty "s" defaultSpanArguments {attributes = map10}
@@ -262,8 +262,8 @@ main = do
             whnf (A.unsafeAttributesFromMap defaultAttributeLimits) map100
         , bench "addAttributesFromBuilder x100" $
             whnf (A.addAttributesFromBuilder defaultAttributeLimits emptyAttributes) builder100
-        , -- 100 existing + 100 new distinct keys: crosses the default limit of
-          -- 128, so 72 of the new keys are dropped and counted.
+        , -- 100 existing keys plus 100 new keys is above the default limit of
+          -- 128. The batch drops 72 of the new keys and counts them.
           bench "addAttributes (HashMap) x100 onto 100 (hits limit)" $
             whnf (A.addAttributes defaultAttributeLimits (A.unsafeAttributesFromMap defaultAttributeLimits map100)) (mkAttrMapFrom 101 100)
         ]
@@ -383,12 +383,12 @@ mkKeys :: Int -> [T.Text]
 mkKeys n = [T.pack ("k" <> show i) | i <- [1 .. n]]
 
 
--- | @n@ distinct text attributes @k1=v1 .. kN=vN@ as a plain map.
+-- | A map of @n@ distinct text attributes, @k1=v1 .. kN=vN@.
 mkAttrMap :: Int -> A.AttributeMap
 mkAttrMap = mkAttrMapFrom 1
 
 
--- | @n@ distinct text attributes with keys starting at @kStart@.
+-- | A map of @n@ distinct text attributes. The first key is @k<start>@.
 mkAttrMapFrom :: Int -> Int -> A.AttributeMap
 mkAttrMapFrom start n =
   H.fromList [(T.pack ("k" <> show i), A.toAttribute (T.pack ("v" <> show i))) | i <- [start .. start + n - 1]]

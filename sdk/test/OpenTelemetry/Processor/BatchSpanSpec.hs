@@ -17,7 +17,7 @@ import OpenTelemetry.Trace.Core
 import Test.Hspec
 
 
--- | An exporter that records every batch it receives, in order.
+-- | An exporter that records each batch it receives, in order.
 recordingExporter :: IO (SpanExporter, IORef [HM.HashMap InstrumentationLibrary (V.Vector ImmutableSpan)])
 recordingExporter = do
   ref <- newIORef []
@@ -54,7 +54,7 @@ withProvider cfg exporter act = do
   pure r
 
 
--- Long scheduled delay so tests observe only explicit flushes.
+-- The scheduled delay is long, so the tests see only the explicit flushes.
 quietConfig :: BatchTimeoutConfig
 quietConfig =
   batchTimeoutConfig
@@ -89,7 +89,7 @@ spec = describe "BatchSpanProcessor" $ do
     withProvider quietConfig exporter $ \tp -> do
       let t = makeTracer tp (instrumentationLibrary "lib" "1") tracerOptions
       replicateM_ 8 $ inSpan'' t "s" defaultSpanArguments (\_ -> pure ())
-      -- Give the worker a moment to wake on the size signal.
+      -- Wait for the worker to wake on the size signal.
       threadDelay 100_000
       batches <- exportedSpans ref
       totalSpans batches `shouldBe` 8
@@ -105,7 +105,7 @@ spec = describe "BatchSpanProcessor" $ do
     forM_ batches $ \b -> sum (map V.length (HM.elems b)) `shouldSatisfy` (<= 4)
 
   it "drops spans when the queue is full and keeps the rest" $ do
-    -- Exporter that blocks until released so the queue cannot drain.
+    -- This exporter blocks until the gate opens, so the queue cannot drain.
     gate <- newIORef False
     ref <- newIORef []
     let exporter =

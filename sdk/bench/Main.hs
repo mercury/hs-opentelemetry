@@ -37,9 +37,8 @@ main = do
   upDown <- meterCreateUpDownCounterInt64 m "bench_updown" Nothing Nothing defaultAdvisoryParameters
   hist <- meterCreateHistogram m "bench_hist" Nothing Nothing defaultAdvisoryParameters
 
-  -- Attribute sets are built once, outside the measured action, so each
-  -- benchmark measures the instrument call with an N-attribute series key
-  -- and not the cost of constructing the attributes.
+  -- The attribute sets are built here, one time. Each benchmark then
+  -- measures only the instrument call with an N-attribute series key.
   oneAttr <- evaluate $ mkAttrs 1
   fiveAttrs <- evaluate $ mkAttrs 5
   tenAttrs <- evaluate $ mkAttrs 10
@@ -195,7 +194,7 @@ main = do
     ]
 
 
--- | @n@ distinct short text attributes: @k1=v1 .. kN=vN@.
+-- | @n@ distinct short text attributes, @k1=v1 .. kN=vN@.
 mkAttrs :: Int -> A.Attributes
 mkAttrs n =
   foldl'
