@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
 
 module OpenTelemetry.Processor.Batch.LogRecord (
@@ -18,9 +19,8 @@ import qualified Data.Vector as V
 import OpenTelemetry.Internal.Common.Types (ExportResult (..), ShutdownResult (..))
 import OpenTelemetry.Internal.Log.Types
 import OpenTelemetry.Internal.Logging (otelLogWarning)
+import OpenTelemetry.Util (casReadModifyIORef_)
 import System.Timeout (timeout)
-import VectorBuilder.Builder as Builder
-import VectorBuilder.Vector as Builder
 
 
 data BatchLogRecordProcessorConfig = BatchLogRecordProcessorConfig
@@ -43,34 +43,34 @@ defaultBatchLogRecordProcessorConfig e =
     }
 
 
-data BoundedBuffer = BoundedBuffer
-  { bufBounds :: !Int
-  , bufExportBounds :: !Int
-  , bufCount :: !Int
-  , bufItems :: !(Builder.Builder ReadableLogRecord)
+{- | Log records waiting for export, newest first.  See the matching
+'Pending' type in "OpenTelemetry.Processor.Batch.Span" for why the
+producer side is a plain cons list behind an evaluated-value CAS.
+-}
+data Pending = Pending
+  { pendingCount :: {-# UNPACK #-} !Int
+  , pendingRecords :: ![ReadableLogRecord]
   }
 
 
-emptyBuffer :: Int -> Int -> BoundedBuffer
-emptyBuffer bounds exportBounds = BoundedBuffer bounds exportBounds 0 mempty
+emptyPending :: Pending
+emptyPending = Pending 0 []
 
 
-pushBuffer :: ReadableLogRecord -> BoundedBuffer -> Maybe BoundedBuffer
-pushBuffer lr buf
-  | bufCount buf >= bufBounds buf = Nothing
-  | otherwise =
-      Just $!
-        buf
-          { bufCount = bufCount buf + 1
-          , bufItems = bufItems buf <> Builder.singleton lr
-          }
+-- | Returns the queue depth after the push, or 'Nothing' if dropped.
+pushPending :: Int -> ReadableLogRecord -> IORef Pending -> IO (Maybe Int)
+pushPending bound lr ref = do
+  old <- casReadModifyIORef_ ref $ \p@(Pending n xs) ->
+    if n >= bound then p else Pending (n + 1) (lr : xs)
+  let !n = pendingCount old
+  pure $! if n >= bound then Nothing else Just (n + 1)
 
 
-buildExportBatch :: BoundedBuffer -> (BoundedBuffer, Vector ReadableLogRecord)
-buildExportBatch buf =
-  ( buf {bufCount = 0, bufItems = mempty}
-  , Builder.build (bufItems buf)
-  )
+-- | Atomically take everything pending, oldest first.
+drainPending :: IORef Pending -> IO (Vector ReadableLogRecord)
+drainPending ref = do
+  p <- casReadModifyIORef_ ref (const emptyPending)
+  pure $! V.fromListN (pendingCount p) (reverse (pendingRecords p))
 
 
 data ProcessorMessage = ScheduledFlush | MaxExportFlush | FlushRequested | Shutdown
@@ -80,7 +80,7 @@ batchLogRecordProcessor :: (MonadIO m) => BatchLogRecordProcessorConfig -> m Log
 batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
   unless rtsSupportsBoundThreads $
     throwIO (userError "The threaded runtime is required for the batch log record processor")
-  batch <- newIORef $ emptyBuffer batchLogMaxQueueSize batchLogMaxExportBatchSize
+  batch <- newIORef emptyPending
   droppedRef <- newIORef (0 :: Int)
   warnedRef <- newIORef False
   workSignal <- newEmptyTMVarIO
@@ -111,7 +111,7 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
               Success -> publishBounded rest
 
   let flushQueueImmediately ret = do
-        batchToExport <- atomicModifyIORef' batch buildExportBatch
+        batchToExport <- drainPending batch
         if V.null batchToExport
           then pure ret
           else do
@@ -134,7 +134,7 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
 
   let workerAction = do
         req <- waiting
-        batchToExport <- atomicModifyIORef' batch buildExportBatch
+        batchToExport <- drainPending batch
         res <- publishBounded batchToExport
         case req of
           Shutdown -> flushQueueImmediately res
@@ -150,15 +150,16 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
     LogRecordProcessor
       { logRecordProcessorOnEmit = \lr _ctxt -> do
           readable <- mkReadableLogRecord lr
-          (dropped, exportNeeded) <- atomicModifyIORef' batch $ \buf ->
-            case pushBuffer readable buf of
-              Nothing -> (buf, (True, True))
-              Just b' ->
-                if bufCount b' >= bufExportBounds b'
-                  then (b', (False, True))
-                  else (b', (False, False))
-          when dropped $ warnOnDrop droppedRef warnedRef batchLogMaxQueueSize "BatchLogRecordProcessor"
-          when exportNeeded $ void $ atomically $ tryPutTMVar workSignal ()
+          mDepth <- pushPending batchLogMaxQueueSize readable batch
+          case mDepth of
+            Nothing -> do
+              warnOnDrop droppedRef warnedRef batchLogMaxQueueSize "BatchLogRecordProcessor"
+              void $ atomically $ tryPutTMVar workSignal ()
+            Just depth ->
+              when (depth `rem` batchLogMaxExportBatchSize == 0) $
+                void $
+                  atomically $
+                    tryPutTMVar workSignal ()
       , logRecordProcessorForceFlush = do
           atomically $ putTMVar flushRequestSignal ()
           atomically $ takeTMVar flushDoneSignal

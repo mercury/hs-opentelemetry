@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
 
 -----------------------------------------------------------------------------
@@ -38,9 +39,8 @@ import qualified OpenTelemetry.Exporter.Span as SpanExporter
 import OpenTelemetry.Internal.Logging (otelLogWarning)
 import OpenTelemetry.Processor.Span
 import OpenTelemetry.Trace.Core
+import OpenTelemetry.Util (casReadModifyIORef_)
 import System.Timeout (timeout)
-import VectorBuilder.Builder as Builder
-import VectorBuilder.Vector as Builder
 
 
 -- | Configurable options for batch exporting frequence and size
@@ -166,40 +166,57 @@ will be incremented.
 --   -- TODO slice and freeze appropriate section
 -- M.slice (gbSectionSize * (r .&. gbSectionMask)
 
-data BoundedMap a = BoundedMap
-  { itemBounds :: !Int
-  , itemMaxExportBounds :: !Int
-  , itemCount :: !Int
-  , itemMap :: HashMap InstrumentationLibrary (Builder.Builder a)
+{- | Spans waiting for export, newest first.
+
+The producer side (every 'endSpan' on every request thread) only conses
+onto this list and bumps the count.  Grouping by instrumentation scope
+happens on the single worker thread in 'groupByScope', so the
+compare-and-swap window on the hot path is one small allocation and does
+not hash 'InstrumentationLibrary'.
+-}
+data Pending = Pending
+  { pendingCount :: {-# UNPACK #-} !Int
+  , pendingSpans :: ![ImmutableSpan]
   }
 
 
-boundedMap :: Int -> Int -> BoundedMap a
-boundedMap bounds exportBounds = BoundedMap bounds exportBounds 0 mempty
+emptyPending :: Pending
+emptyPending = Pending 0 []
 
 
-push :: ImmutableSpan -> BoundedMap ImmutableSpan -> Maybe (BoundedMap ImmutableSpan)
-push s m =
-  if itemCount m >= itemBounds m
-    then Nothing
-    else
-      Just $!
-        m
-          { itemCount = itemCount m + 1
-          , itemMap =
-              HashMap.insertWith
-                (<>)
-                (tracerName $ spanTracer s)
-                (Builder.singleton s)
-                $ itemMap m
-          }
+{- | Push a span unless the queue is at capacity.  Returns the queue
+depth after the push, or 'Nothing' when the span was dropped.
+
+Uses an evaluated-value CAS rather than 'atomicModifyIORef'', which
+installs a thunk and makes concurrent callers block on each other's
+blackholes.  Under contention losers simply retry a very cheap step.
+-}
+pushPending :: Int -> ImmutableSpan -> IORef Pending -> IO (Maybe Int)
+pushPending bound s ref = do
+  old <- casReadModifyIORef_ ref $ \p@(Pending n xs) ->
+    if n >= bound then p else Pending (n + 1) (s : xs)
+  let !n = pendingCount old
+  pure $! if n >= bound then Nothing else Just (n + 1)
 
 
-buildExport :: BoundedMap a -> (BoundedMap a, HashMap InstrumentationLibrary (Vector a))
-buildExport m =
-  ( m {itemCount = 0, itemMap = mempty}
-  , Builder.build <$> itemMap m
-  )
+-- | Atomically take everything that is pending and reset the queue.
+drainPending :: IORef Pending -> IO [ImmutableSpan]
+drainPending ref = pendingSpans <$> casReadModifyIORef_ ref (const emptyPending)
+
+
+{- | Group a newest-first span list by instrumentation scope, preserving
+chronological order within each scope.  Runs on the worker thread only.
+-}
+groupByScope :: [ImmutableSpan] -> HashMap InstrumentationLibrary (Vector ImmutableSpan)
+groupByScope spans =
+  (\(n, xs) -> V.fromListN n xs)
+    <$> foldl'
+      (\m s -> HashMap.alter (Just . step s) (tracerName (spanTracer s)) m)
+      HashMap.empty
+      spans
+  where
+    step s Nothing = (1 :: Int, [s])
+    step s (Just (n, xs)) = (n + 1, s : xs)
 
 
 data ProcessorMessage = ScheduledFlush | MaxExportFlush | FlushRequested | Shutdown
@@ -238,7 +255,7 @@ data ProcessorMessage = ScheduledFlush | MaxExportFlush | FlushRequested | Shutd
 batchProcessor :: (MonadIO m) => BatchTimeoutConfig -> SpanExporter -> m SpanProcessor
 batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
   unless rtsSupportsBoundThreads $ error "The hs-opentelemetry batch processor does not work without the -threaded GHC flag!"
-  batch <- newIORef $ boundedMap maxQueueSize maxExportBatchSize
+  batch <- newIORef emptyPending
   droppedRef <- newIORef (0 :: Int)
   warnedRef <- newIORef False
   workSignal <- newEmptyTMVarIO
@@ -279,8 +296,10 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
               SpanExporter.Failure _ -> pure res
               SpanExporter.Success -> publishBounded rest
 
+  let takeBatch = groupByScope <$> drainPending batch
+
   let flushQueueImmediately ret = do
-        batchToProcess <- atomicModifyIORef' batch buildExport
+        batchToProcess <- takeBatch
         if null batchToProcess
           then pure ret
           else do
@@ -303,7 +322,7 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
 
   let workerAction = do
         req <- waiting
-        batchToProcess <- atomicModifyIORef' batch buildExport
+        batchToProcess <- takeBatch
         res <- publishBounded batchToProcess
 
         case req of
@@ -322,15 +341,19 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
     SpanProcessor
       { spanProcessorOnStart = \_ _ -> pure ()
       , spanProcessorOnEnd = \s -> do
-          (dropped, exportNeeded) <- atomicModifyIORef' batch $ \builder ->
-            case push s builder of
-              Nothing -> (builder, (True, True))
-              Just b' ->
-                if itemCount b' >= itemMaxExportBounds b'
-                  then (b', (False, True))
-                  else (b', (False, False))
-          when dropped $ warnOnDrop droppedRef warnedRef maxQueueSize "BatchSpanProcessor"
-          when exportNeeded $ void $ atomically $ tryPutTMVar workSignal ()
+          mDepth <- pushPending maxQueueSize s batch
+          case mDepth of
+            Nothing -> do
+              warnOnDrop droppedRef warnedRef maxQueueSize "BatchSpanProcessor"
+              void $ atomically $ tryPutTMVar workSignal ()
+            Just depth ->
+              -- Wake the worker once per full batch rather than on every
+              -- span past the threshold; the STM transaction is far more
+              -- expensive than the push itself and touches a shared TVar.
+              when (depth `rem` maxExportBatchSize == 0) $
+                void $
+                  atomically $
+                    tryPutTMVar workSignal ()
       , spanProcessorForceFlush = do
           atomically $ putTMVar flushRequestSignal ()
           atomically $ takeTMVar flushDoneSignal
