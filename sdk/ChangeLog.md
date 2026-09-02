@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Performance
+- **Batch span and log processors no longer serialize producers on a global
+  `atomicModifyIORef'`.** The enqueue path is now a cons onto a counted list
+  behind an evaluated-value CAS; grouping by instrumentation scope happens on
+  the worker thread. Aggregate enqueue cost at 8 threads went from about
+  3.9 µs/span to about 0.4 µs/span on an 18-core machine. The worker is
+  signalled once per `maxExportBatchSize` instead of on every span past it.
+- **Metrics hot path is 5x to 8x cheaper single-threaded and 14x cheaper at
+  16 threads.** The instrument half of the series key is pre-hashed
+  (`Data.Hashable.Hashed`), the four `HashMap` operations per record are
+  collapsed into one `alterF`, and the shared state is updated with an
+  evaluated-value CAS instead of `atomicModifyIORef'`.
+- **Fixed a thunk leak in metric aggregation cells.** `SumCell` sums,
+  histogram bucket counts, and histogram min/max were accumulated lazily, so
+  residency grew linearly with the number of records between collections
+  (27 MB after 1M counter adds; 77 MB after 1M histogram records). Residency
+  is now constant.
+- `hs-opentelemetry-sdk-bench` and `hs-opentelemetry-sdk-bench-batch-contention`
+  are now registered benchmark components. The sources existed but were not
+  buildable.
+- Dropped the unused `vector-builder` dependency.
+- Added 10, 20, and 100 attribute cases to the counter and histogram
+  benchmarks.
+
+### Tests
+- Added `OpenTelemetry.Processor.BatchSpanSpec` covering grouping, ordering,
+  auto-export, chunking, drop-when-full, shutdown flush, and concurrent
+  producers.
+
 ## 1.0.0.0 - 2026-05-29
 
 ### Spec conformance (1.55.0 audit)

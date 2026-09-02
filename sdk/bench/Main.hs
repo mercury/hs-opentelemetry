@@ -4,9 +4,11 @@
 
 module Main (main) where
 
+import Control.Exception (evaluate)
 import Control.Monad (void)
 import qualified Data.HashMap.Strict as H
 import Data.IORef
+import Data.List (foldl')
 import qualified Data.Text as T
 import OpenTelemetry.Attributes (defaultAttributeLimits, emptyAttributes)
 import qualified OpenTelemetry.Attributes as A
@@ -35,12 +37,14 @@ main = do
   upDown <- meterCreateUpDownCounterInt64 m "bench_updown" Nothing Nothing defaultAdvisoryParameters
   hist <- meterCreateHistogram m "bench_hist" Nothing Nothing defaultAdvisoryParameters
 
-  let oneAttr = A.addAttribute defaultAttributeLimits emptyAttributes "key" ("v" :: T.Text)
-      fiveAttrs =
-        foldl
-          (\a (k, v) -> A.addAttribute defaultAttributeLimits a k (v :: T.Text))
-          emptyAttributes
-          [("k1", "v"), ("k2", "v"), ("k3", "v"), ("k4", "v"), ("k5", "v")]
+  -- Attribute sets are built once, outside the measured action, so each
+  -- benchmark measures the instrument call with an N-attribute series key
+  -- and not the cost of constructing the attributes.
+  oneAttr <- evaluate $ mkAttrs 1
+  fiveAttrs <- evaluate $ mkAttrs 5
+  tenAttrs <- evaluate $ mkAttrs 10
+  twentyAttrs <- evaluate $ mkAttrs 20
+  hundredAttrs <- evaluate $ mkAttrs 100
 
   dummyProcessor <- mkCountingProcessor
   activeTp <- createTracerProvider [dummyProcessor] emptyTracerProviderOptions
@@ -67,6 +71,15 @@ main = do
         , bench "add 1 (5 attrs)" $
             whnfIO $
               counterAdd counterI 1 fiveAttrs
+        , bench "add 1 (10 attrs)" $
+            whnfIO $
+              counterAdd counterI 1 tenAttrs
+        , bench "add 1 (20 attrs)" $
+            whnfIO $
+              counterAdd counterI 1 twentyAttrs
+        , bench "add 1 (100 attrs)" $
+            whnfIO $
+              counterAdd counterI 1 hundredAttrs
         ]
     , bgroup
         "counter-double"
@@ -94,6 +107,15 @@ main = do
         , bench "record (5 attrs)" $
             whnfIO $
               histogramRecord hist 42.0 fiveAttrs
+        , bench "record (10 attrs)" $
+            whnfIO $
+              histogramRecord hist 42.0 tenAttrs
+        , bench "record (20 attrs)" $
+            whnfIO $
+              histogramRecord hist 42.0 twentyAttrs
+        , bench "record (100 attrs)" $
+            whnfIO $
+              histogramRecord hist 42.0 hundredAttrs
         ]
     , bgroup
         "emitLogRecord"
@@ -171,6 +193,15 @@ main = do
                 (void $ emitLogRecord activeLogger emptyLogRecordArguments {body = TextValue "msg"})
         ]
     ]
+
+
+-- | @n@ distinct short text attributes: @k1=v1 .. kN=vN@.
+mkAttrs :: Int -> A.Attributes
+mkAttrs n =
+  foldl'
+    (\a i -> A.addAttribute defaultAttributeLimits a (T.pack ("k" <> show i)) (T.pack ("v" <> show i)))
+    emptyAttributes
+    [1 .. n]
 
 
 mkCountingProcessor :: IO SpanProcessor
