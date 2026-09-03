@@ -23,6 +23,7 @@ module OpenTelemetry.SemanticsConfig (
   -- * Reading from the environment
   getSemanticsOptions,
   getSemanticsOptions',
+  semanticsOptions,
 ) where
 
 import Control.Exception (SomeException, throwIO, try)
@@ -164,3 +165,22 @@ the env var every time the function is called.
 getSemanticsOptions :: IO SemanticsOptions
 getSemanticsOptions = unsafePerformIO $ memoize getSemanticsOptions'
 {-# NOINLINE getSemanticsOptions #-}
+
+
+{- | The value of 'getSemanticsOptions' as a pure constant.
+
+Use this in pure code that must stay pure. In particular, the @code.*@
+attributes for a span are a pure function of this value and the
+'GHC.Stack.CallStack'. When the call site has a static stack, GHC can then
+compute the attributes one time for that call site. An 'IO' read of the
+options in the same place stops that optimization, and the attributes are
+rebuilt on every call.
+
+The value is the same one that 'getSemanticsOptions' returns, so it is read
+one time per process and does not change after that.
+
+@since 1.0.1.0
+-}
+semanticsOptions :: SemanticsOptions
+semanticsOptions = unsafePerformIO getSemanticsOptions
+{-# NOINLINE semanticsOptions #-}

@@ -11,6 +11,7 @@ import qualified OpenTelemetry.ContextSpec as ContextSpec
 import qualified OpenTelemetry.LogSpec as LogSpec
 import qualified OpenTelemetry.MeterProviderSpec as MeterProviderSpec
 import qualified OpenTelemetry.MetricReaderSpec as MetricReaderSpec
+import qualified OpenTelemetry.Processor.BatchSpanSpec as BatchSpanSpec
 import qualified OpenTelemetry.Resource.DetectorSpec as DetectorSpec
 import qualified OpenTelemetry.ResourceSpec as ResourceSpec
 import OpenTelemetry.Trace (initializeGlobalTracerProvider, withTracerProvider)
@@ -54,6 +55,7 @@ runTests = do
     LogSpec.spec
     MeterProviderSpec.spec
     MetricReaderSpec.spec
+    BatchSpanSpec.spec
     ConfigurationSpec.spec
 
 

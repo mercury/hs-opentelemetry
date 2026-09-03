@@ -42,6 +42,64 @@ spec = Hspec.describe "Attributes" $ do
           result = A.addAttributes A.defaultAttributeLimits initial batch
       A.lookupAttribute result Example `Hspec.shouldBe` Just (A.toAttribute ("new" :: T.Text))
 
+    Hspec.it "onto an empty base equals building from the map" $ do
+      let m = H.fromList [(T.pack ("k" <> show i), A.toAttribute i) | i <- [1 .. 50 :: Int]]
+          viaAdd = A.addAttributes A.defaultAttributeLimits A.emptyAttributes m
+      A.getAttributeMap viaAdd `Hspec.shouldBe` m
+      A.getCount viaAdd `Hspec.shouldBe` 50
+      A.getDropped viaAdd `Hspec.shouldBe` 0
+
+    Hspec.it "onto a non-empty base merges with new values winning" $ do
+      let base = addAttributeDefault "a" (1 :: Int) (addAttributeDefault "b" (2 :: Int) A.emptyAttributes)
+          batch = H.fromList [("b", A.toAttribute (20 :: Int)), ("c", A.toAttribute (3 :: Int))]
+          result = A.addAttributes A.defaultAttributeLimits base batch
+      A.getAttributeMap result
+        `Hspec.shouldBe` H.fromList [("a", A.toAttribute (1 :: Int)), ("b", A.toAttribute (20 :: Int)), ("c", A.toAttribute (3 :: Int))]
+      A.getCount result `Hspec.shouldBe` 3
+
+    -- Common §Attribute limits: count limit applies to new keys only
+    -- https://opentelemetry.io/docs/specs/otel/common/#attribute-limits
+    Hspec.it "respects the count limit and counts dropped keys" $ do
+      let lim = A.AttributeLimits {attributeCountLimit = Just 3, attributeLengthLimit = Nothing}
+          base = A.addAttribute lim (A.addAttribute lim A.emptyAttributes "a" (1 :: Int)) "b" (2 :: Int)
+          batch = H.fromList [("b", A.toAttribute (20 :: Int)), ("c", A.toAttribute (3 :: Int)), ("d", A.toAttribute (4 :: Int)), ("e", A.toAttribute (5 :: Int))]
+          result = A.addAttributes lim base batch
+      -- b replaces in place; one of c/d/e fits; two are dropped.
+      A.getCount result `Hspec.shouldBe` 3
+      A.getDropped result `Hspec.shouldBe` 2
+      A.lookupAttribute result "b" `Hspec.shouldBe` Just (A.toAttribute (20 :: Int))
+      H.size (A.getAttributeMap result) `Hspec.shouldBe` 3
+
+    Hspec.it "onto an empty base still respects the count limit" $ do
+      let lim = A.AttributeLimits {attributeCountLimit = Just 2, attributeLengthLimit = Nothing}
+          batch = H.fromList [(T.pack ("k" <> show i), A.toAttribute i) | i <- [1 .. 5 :: Int]]
+          result = A.addAttributes lim A.emptyAttributes batch
+      A.getCount result `Hspec.shouldBe` 2
+      A.getDropped result `Hspec.shouldBe` 3
+
+    Hspec.it "onto an empty base keeps a previously accumulated dropped count" $ do
+      let lim = A.AttributeLimits {attributeCountLimit = Just 0, attributeLengthLimit = Nothing}
+          base = A.addAttribute lim A.emptyAttributes "x" (1 :: Int)
+          result = A.addAttributes A.defaultAttributeLimits base (H.singleton "y" (A.toAttribute (2 :: Int)))
+      A.getDropped base `Hspec.shouldBe` 1
+      A.getDropped result `Hspec.shouldBe` 1
+      A.getCount result `Hspec.shouldBe` 1
+
+    Hspec.it "applies the value length limit to new text values" $ do
+      let lim = A.AttributeLimits {attributeCountLimit = Nothing, attributeLengthLimit = Just 3}
+          batch = H.fromList [("s", A.toAttribute ("abcdef" :: T.Text)), ("n", A.toAttribute (12345 :: Int))]
+          result = A.addAttributes lim A.emptyAttributes batch
+          result2 = A.addAttributes lim (addAttributeDefault "z" (0 :: Int) A.emptyAttributes) batch
+      A.lookupAttribute result "s" `Hspec.shouldBe` Just (A.toAttribute ("abc" :: T.Text))
+      A.lookupAttribute result "n" `Hspec.shouldBe` Just (A.toAttribute (12345 :: Int))
+      A.lookupAttribute result2 "s" `Hspec.shouldBe` Just (A.toAttribute ("abc" :: T.Text))
+
+    Hspec.it "converts non-Attribute values" $ do
+      let batch = H.fromList [("t", "text" :: T.Text), ("u", "more")]
+          result = A.addAttributes A.defaultAttributeLimits A.emptyAttributes batch
+      A.lookupAttribute result "t" `Hspec.shouldBe` Just (A.toAttribute ("text" :: T.Text))
+      A.getCount result `Hspec.shouldBe` 2
+
   -- Implementation-specific: merge helper (not part of the portable Attributes API)
   -- https://opentelemetry.io/docs/specs/otel/common/#attribute
   Hspec.describe "unsafeMergeAttributesIgnoringLimits" $ do

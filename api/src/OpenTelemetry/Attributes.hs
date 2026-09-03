@@ -70,6 +70,7 @@ module OpenTelemetry.Attributes (
   addAttribute,
   addAttributeByKey,
   addAttributes,
+  addAttributeMap,
   addAttributesFromBuilder,
   lookupAttribute,
   lookupAttributeByKey,
@@ -223,40 +224,84 @@ addAttributeByKey limits attrs (AttributeKey k) v = addAttribute limits attrs k 
   #-}
 
 
--- | @since 0.0.1.0
+{- | Add a batch of attributes. Each value is converted with 'toAttribute'.
+
+If the values are already 'Attribute's, use 'addAttributeMap'. It does not
+do the conversion pass.
+
+@since 0.0.1.0
+-}
 addAttributes :: (ToAttribute a) => AttributeLimits -> Attributes -> H.HashMap Text a -> Attributes
-addAttributes AttributeLimits {..} Attributes {..} attrs
-  | H.null attrs = Attributes attributeMap attributesCount attributesDropped
+addAttributes limits@AttributeLimits {..} base attrs
+  | H.null attrs = base
   | otherwise =
       let convertVal = case attributeLengthLimit of
             Nothing -> toAttribute
             Just limit -> limitLengths limit . toAttribute
-      in case attributeCountLimit of
-           Nothing ->
-             let (!newAttrs, !added) =
-                   H.foldlWithKey'
-                     (\(!m, !n) k v -> (H.insert k (convertVal v) m, if H.member k attributeMap then n else n + 1))
-                     (attributeMap, 0 :: Int)
-                     attrs
-                 !newCount = attributesCount + added
-             in Attributes newAttrs newCount attributesDropped
-           Just limit_ ->
-             let (!merged, !accepted, !totalNew) =
-                   H.foldlWithKey'
-                     ( \(!m, !n, !seen) k v ->
-                         if H.member k attributeMap
-                           then (H.insert k (convertVal v) m, n, seen)
-                           else
-                             if n < limit_
-                               then (H.insert k (convertVal v) m, n + 1, seen + 1)
-                               else (m, n, seen + 1)
-                     )
-                     (attributeMap, attributesCount, 0 :: Int)
-                     attrs
-                 !newKeys = accepted - attributesCount
-                 !dropped = totalNew - newKeys
-             in Attributes merged accepted (attributesDropped + dropped)
+      in mergeConverted limits base (H.map convertVal attrs)
 {-# INLINE addAttributes #-}
+
+
+{- | Add a batch of attributes that are already 'Attribute's.
+
+The span, event, and link code in "OpenTelemetry.Trace.Core" uses this
+function. The batch is merged with 'H.union', so the two maps share
+structure, and a batch that is added to an empty base becomes the new map.
+The per-key fold runs only when the result would be above the count limit,
+so the drop rules at the limit do not change.
+
+@since 1.0.1.0
+-}
+addAttributeMap :: AttributeLimits -> Attributes -> Map.AttributeMap -> Attributes
+addAttributeMap limits@AttributeLimits {..} base attrs
+  | H.null attrs = base
+  | otherwise =
+      let !limited = case attributeLengthLimit of
+            Nothing -> attrs
+            Just limit -> H.map (limitLengths limit) attrs
+      in mergeConverted limits base limited
+{-# INLINE addAttributeMap #-}
+
+
+-- The length limit is already applied to the values in @attrs@.
+mergeConverted :: AttributeLimits -> Attributes -> Map.AttributeMap -> Attributes
+mergeConverted AttributeLimits {..} Attributes {..} attrs
+  | H.null attributeMap =
+      -- The base is empty, so the batch becomes the map. Only the count
+      -- limit applies here. The drop count from the base is kept.
+      let !sz = H.size attrs
+      in case attributeCountLimit of
+           Just limit_
+             | sz > limit_ -> slowMerge limit_
+           _ -> Attributes attrs sz attributesDropped
+  | otherwise =
+      -- New values replace old values for the same key, as 'H.insert' does.
+      let !merged = H.union attrs attributeMap
+          !newCount = H.size merged
+      in case attributeCountLimit of
+           Just limit_
+             | newCount > limit_ -> slowMerge limit_
+           _ -> Attributes merged newCount attributesDropped
+  where
+    -- Per-key path for a batch that does not fit under the count limit.
+    -- Existing keys are replaced. New keys are added while the count is
+    -- below the limit, and the rest are counted as dropped.
+    slowMerge limit_ =
+      let (!merged, !accepted, !totalNew) =
+            H.foldlWithKey'
+              ( \(!m, !n, !seen) k v ->
+                  if H.member k attributeMap
+                    then (H.insert k v m, n, seen)
+                    else
+                      if n < limit_
+                        then (H.insert k v m, n + 1, seen + 1)
+                        else (m, n, seen + 1)
+              )
+              (attributeMap, attributesCount, 0 :: Int)
+              attrs
+          !newKeys = accepted - attributesCount
+          !dropped = totalNew - newKeys
+      in Attributes merged accepted (attributesDropped + dropped)
 
 
 {- | Like 'addAttributes', but consumes an 'AttrsBuilder' instead of a 'HashMap'.
@@ -266,26 +311,11 @@ an intermediate collection.
 @since 0.4.0.0
 -}
 addAttributesFromBuilder :: AttributeLimits -> Attributes -> AttrsBuilder -> Attributes
-addAttributesFromBuilder AttributeLimits {..} _as@Attributes {..} (AttrsBuilder fold) =
-  let limitVal = case attributeLengthLimit of
-        Nothing -> id
-        Just limit -> limitLengths limit
-  in case attributeCountLimit of
-       Nothing ->
-         let (!newMap, !added) = fold (\(!m, !n) k v -> (H.insert k (limitVal v) m, if H.member k m then n else n + 1)) (attributeMap, 0 :: Int)
-             !newCount = attributesCount + added
-         in Attributes newMap newCount attributesDropped
-       Just limit_ ->
-         let step (!m, !cnt, !drp) !k v =
-               let a = limitVal v
-               in if H.member k m
-                    then (H.insert k a m, cnt, drp)
-                    else
-                      if cnt < limit_
-                        then (H.insert k a m, cnt + 1, drp)
-                        else (m, cnt, drp + 1)
-             (!newMap, !newCount, !newDropped) = fold step (attributeMap, attributesCount, attributesDropped)
-         in Attributes newMap newCount newDropped
+addAttributesFromBuilder limits base builder =
+  -- Build the batch as a small map, then merge it. Each insert into the
+  -- live map copies a path through that map, so one merge is cheaper than
+  -- one insert per key.
+  addAttributeMap limits base (buildAttrs builder)
 {-# INLINE addAttributesFromBuilder #-}
 
 

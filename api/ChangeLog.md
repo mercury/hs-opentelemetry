@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Performance
+- `createSpan` does not build the `code.*` attributes for a Dropped span.
+  The source-location attributes are now lazy, as they are in `inSpan`.
+  `createSpan` on a no-op tracer went from 168 ns and 815 B to 10 ns and
+  0 B. The `withFrozenCallStack` opt-out still works.
+- `addAttributes` merges the batch with `HashMap.union`. Before, it inserted
+  each key of the batch into the live map one at a time. That was O(n log n)
+  and copied a path through the map for each key, also when the base map was
+  empty. The per-key path now runs only when the batch does not fit under the
+  count limit. To add 100 prepared attributes to a span went from 4.5 µs and
+  41 KB to 0.42 µs and 1.3 KB. For 20 attributes it went from 851 ns to
+  195 ns. Event attributes and link attributes take the same path.
+- New function `OpenTelemetry.Attributes.addAttributeMap`. It is
+  `addAttributes` for values that are already `Attribute`s, without the
+  `toAttribute` conversion pass. The span-level `addAttributes` in
+  `OpenTelemetry.Trace.Core` uses it, and so do `addEvent` and the link
+  code.
+- `addAttributesFromBuilder` builds the batch as a small map and then merges
+  it. This is about 25% cheaper from 10 to 100 attributes. GHC can also float
+  a static builder out of a call site as a constant map.
+- New `OpenTelemetry.SemanticsConfig.semanticsOptions`. It is the value of
+  `getSemanticsOptions` as a pure constant. `OpenTelemetry.Trace.Core` uses
+  it in place of inline `unsafePerformIO` calls, so the `code.*` attributes
+  for a call site with a static call stack stay a constant that GHC computes
+  one time.
+- The API benchmark has new cases at 10, 20 and 100 attributes. They cover
+  sequential `addAttribute` calls, batch `addAttributes` calls, the
+  `addAttributes'` builder path, `createSpan` with initial attributes, and
+  the pure `Attributes` functions.
+
 ## 1.0.0.0 - 2026-05-29
 
 ### Full Spec conformance against 1.55.0

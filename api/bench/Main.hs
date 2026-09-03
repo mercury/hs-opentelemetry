@@ -4,7 +4,8 @@
 
 module Main (main) where
 
-import Control.Monad (void)
+import Control.Exception (evaluate)
+import Control.Monad (forM_, void)
 import qualified Data.HashMap.Strict as H
 import Data.IORef
 import qualified Data.Text as T
@@ -38,6 +39,22 @@ main = do
   let activeTracer = makeTracer activeTp (InstrumentationLibrary "bench" "1.0" "" emptyAttributes) tracerOptions
 
   calibRef <- newIORef ()
+
+  -- The inputs for the larger attribute counts are built here, one time.
+  -- The benchmarks then measure only the span or Attributes operation.
+  map10 <- evaluate $ mkAttrMap 10
+  map20 <- evaluate $ mkAttrMap 20
+  map100 <- evaluate $ mkAttrMap 100
+  let builder10 = mkAttrBuilder 10
+      builder20 = mkAttrBuilder 20
+      builder100 = mkAttrBuilder 100
+  keys10 <- evaluate $ mkKeys 10
+  keys20 <- evaluate $ mkKeys 20
+  keys100 <- evaluate $ mkKeys 100
+  map5 <- evaluate $ mkAttrMap 5
+  -- A populated base with keys that do not collide with the batches above.
+  base5 <- evaluate $ A.unsafeAttributesFromMap defaultAttributeLimits (mkAttrMapFrom 1001 5)
+  base100 <- evaluate $ A.unsafeAttributesFromMap defaultAttributeLimits (mkAttrMapFrom 1001 100)
 
   defaultMain
     [ bgroup
@@ -99,6 +116,13 @@ main = do
             addAttribute s "k8" ("v" :: T.Text)
             addAttribute s "k9" ("v" :: T.Text)
             addAttribute s "k10" ("v" :: T.Text)
+        , -- Each attribute costs one CAS and one insert into a map that grows.
+          bench "on live span (20 attrs sequential)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            forM_ keys20 $ \k -> addAttribute s k ("v" :: T.Text)
+        , bench "on live span (100 attrs sequential)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            forM_ keys100 $ \k -> addAttribute s k ("v" :: T.Text)
         ]
     , bgroup
         "addAttributes-batch"
@@ -144,6 +168,61 @@ main = do
               A.attr "method" ("GET" :: T.Text)
                 <> A.attr "url" ("https://example.com/api" :: T.Text)
                 <> A.attr "status" (200 :: Int)
+        , -- The inputs below are prepared. These cases measure the merge into the span.
+          bench "H.fromList 10 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes s map10
+        , bench "H.fromList 20 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes s map20
+        , bench "H.fromList 100 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes s map100
+        , bench "AttrsBuilder 10 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes' s builder10
+        , bench "AttrsBuilder 20 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes' s builder20
+        , bench "AttrsBuilder 100 attrs (pre-built)" $ whnfIO $ do
+            s <- createSpan activeTracer empty "s" defaultSpanArguments
+            addAttributes' s builder100
+        ]
+    , bgroup
+        "addAttributes-vs-legacy"
+        -- Same binary, same inputs: the merge in this branch against the
+        -- per-key fold it replaced. Both return the merged map in WHNF.
+        [ bench "legacy, 5 onto empty" $ whnf (legacyMerge defaultAttributeLimits emptyAttributes) map5
+        , bench "new, 5 onto empty" $ whnf (newMerge defaultAttributeLimits emptyAttributes) map5
+        , bench "legacy, 20 onto empty" $ whnf (legacyMerge defaultAttributeLimits emptyAttributes) map20
+        , bench "new, 20 onto empty" $ whnf (newMerge defaultAttributeLimits emptyAttributes) map20
+        , bench "legacy, 100 onto empty" $ whnf (legacyMerge defaultAttributeLimits emptyAttributes) map100
+        , bench "new, 100 onto empty" $ whnf (newMerge defaultAttributeLimits emptyAttributes) map100
+        , bench "legacy, 5 onto 5" $ whnf (legacyMerge defaultAttributeLimits base5) map5
+        , bench "new, 5 onto 5" $ whnf (newMerge defaultAttributeLimits base5) map5
+        , bench "legacy, 20 onto 5" $ whnf (legacyMerge defaultAttributeLimits base5) map20
+        , bench "new, 20 onto 5" $ whnf (newMerge defaultAttributeLimits base5) map20
+        , bench "legacy, 100 onto 5" $ whnf (legacyMerge defaultAttributeLimits base5) map100
+        , bench "new, 100 onto 5" $ whnf (newMerge defaultAttributeLimits base5) map100
+        , bench "legacy, 5 onto 100" $ whnf (legacyMerge defaultAttributeLimits base100) map5
+        , bench "new, 5 onto 100" $ whnf (newMerge defaultAttributeLimits base100) map5
+        ]
+    , bgroup
+        "createSpan-initial-attrs"
+        -- Attributes in SpanArguments go through unsafeAttributesFromMap and
+        -- one insert for thread.id when the span is created.
+        [ bench "10 attrs" $
+            whnfIO $
+              createSpan activeTracer empty "s" defaultSpanArguments {attributes = map10}
+        , bench "20 attrs" $
+            whnfIO $
+              createSpan activeTracer empty "s" defaultSpanArguments {attributes = map20}
+        , bench "100 attrs" $
+            whnfIO $
+              createSpan activeTracer empty "s" defaultSpanArguments {attributes = map100}
+        , bench "100 attrs, Dropped (no processors)" $
+            whnfIO $
+              createSpan noopTracer empty "s" defaultSpanArguments {attributes = map100}
         ]
     , bgroup
         "Attributes-pure"
@@ -194,6 +273,22 @@ main = do
                     )
               )
               emptyAttributes
+        , bench "addAttribute x20 (distinct keys, pre-built)" $
+            whnf (\ks -> foldl (\acc k -> A.addAttribute defaultAttributeLimits acc k ("v" :: T.Text)) emptyAttributes ks) keys20
+        , bench "addAttribute x100 (distinct keys, pre-built)" $
+            whnf (\ks -> foldl (\acc k -> A.addAttribute defaultAttributeLimits acc k ("v" :: T.Text)) emptyAttributes ks) keys100
+        , bench "addAttributes (HashMap) x20" $
+            whnf (A.addAttributes defaultAttributeLimits emptyAttributes) map20
+        , bench "addAttributes (HashMap) x100" $
+            whnf (A.addAttributes defaultAttributeLimits emptyAttributes) map100
+        , bench "unsafeAttributesFromMap x100" $
+            whnf (A.unsafeAttributesFromMap defaultAttributeLimits) map100
+        , bench "addAttributesFromBuilder x100" $
+            whnf (A.addAttributesFromBuilder defaultAttributeLimits emptyAttributes) builder100
+        , -- 100 existing keys plus 100 new keys is above the default limit of
+          -- 128. The batch drops 72 of the new keys and counts them.
+          bench "addAttributes (HashMap) x100 onto 100 (hits limit)" $
+            whnf (A.addAttributes defaultAttributeLimits (A.unsafeAttributesFromMap defaultAttributeLimits map100)) (mkAttrMapFrom 101 100)
         ]
     , bgroup
         "context"
@@ -305,6 +400,66 @@ main = do
               newTraceAndSpanId DefaultIdGenerator
         ]
     ]
+
+
+mkKeys :: Int -> [T.Text]
+mkKeys n = [T.pack ("k" <> show i) | i <- [1 .. n]]
+
+
+-- | A map of @n@ distinct text attributes, @k1=v1 .. kN=vN@.
+mkAttrMap :: Int -> A.AttributeMap
+mkAttrMap = mkAttrMapFrom 1
+
+
+-- | A map of @n@ distinct text attributes. The first key is @k<start>@.
+mkAttrMapFrom :: Int -> Int -> A.AttributeMap
+mkAttrMapFrom start n =
+  H.fromList [(T.pack ("k" <> show i), A.toAttribute (T.pack ("v" <> show i))) | i <- [start .. start + n - 1]]
+
+
+{- | The merge in this branch, reduced to the map so it compares like for
+like with 'legacyMerge'.
+-}
+newMerge :: A.AttributeLimits -> A.Attributes -> A.AttributeMap -> A.AttributeMap
+newMerge limits base attrs = A.getAttributeMap (A.addAttributeMap limits base attrs)
+
+
+{- | The batch merge as it was before this branch: one 'H.insert' per key,
+with a membership check against the base map, folded over the batch. It is
+kept here so that the two versions run in the same benchmark binary. It
+returns the merged map. The count and dropped fields of the original are
+computed in the same fold, so the work is the same.
+-}
+legacyMerge :: A.AttributeLimits -> A.Attributes -> A.AttributeMap -> A.AttributeMap
+legacyMerge A.AttributeLimits {..} base attrs =
+  let attributeMap = A.getAttributeMap base
+      attributesCount = A.getCount base
+  in case attributeCountLimit of
+       Nothing ->
+         let (!newAttrs, !_added) =
+               H.foldlWithKey'
+                 (\(!m, !n) k v -> (H.insert k v m, if H.member k attributeMap then n else n + 1))
+                 (attributeMap, 0 :: Int)
+                 attrs
+         in newAttrs
+       Just limit_ ->
+         let (!merged, !_accepted, !_totalNew) =
+               H.foldlWithKey'
+                 ( \(!m, !n, !seen) k v ->
+                     if H.member k attributeMap
+                       then (H.insert k v m, n, seen)
+                       else
+                         if n < limit_
+                           then (H.insert k v m, n + 1, seen + 1)
+                           else (m, n, seen + 1)
+                 )
+                 (attributeMap, attributesCount, 0 :: Int)
+                 attrs
+         in merged
+
+
+mkAttrBuilder :: Int -> A.AttrsBuilder
+mkAttrBuilder n = mconcat [A.attr (T.pack ("k" <> show i)) (T.pack ("v" <> show i)) | i <- [1 .. n]]
 
 
 mkCountingProcessor :: IO SpanProcessor

@@ -32,7 +32,7 @@ import Data.ByteString (ByteString)
 import Data.Foldable (toList)
 import qualified Data.HashMap.Strict as H
 import qualified Data.HashSet as HS
-import Data.Hashable (Hashable)
+import Data.Hashable (Hashable (..), Hashed, hashed, unhashed)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32, Int64)
 import qualified Data.IntMap.Strict as IM
@@ -42,6 +42,7 @@ import qualified Data.Sequence as Seq
 import Data.Text (Text, pack)
 import Data.Vector (Vector)
 import qualified Data.Vector as V
+import qualified Data.Vector.Unboxed as VU
 import Data.Word (Word64)
 import GHC.Generics (Generic)
 import OpenTelemetry.Attributes (Attributes, addAttribute, defaultAttributeLimits, emptyAttributes)
@@ -85,6 +86,7 @@ import OpenTelemetry.Metric.View (View (..), ViewAggregation (..), findMatchingV
 import OpenTelemetry.Resource (MaterializedResources)
 import OpenTelemetry.Trace.Core (SpanContext (..), getSpanContext, isValid)
 import OpenTelemetry.Trace.Id (spanIdBytes, traceIdBytes)
+import OpenTelemetry.Util (casModifyIORef_)
 import System.Clock (Clock (Realtime), getTime, toNanoSecs)
 
 
@@ -139,7 +141,7 @@ defaultSdkMeterProviderOptions =
 
 data SdkMeterStorageState = SdkMeterStorageState
   { storageCells :: !(H.HashMap DimKey Cell)
-  , seriesCountByDims :: !(H.HashMap InstrumentDims Int)
+  , seriesCountByDims :: !(H.HashMap (Hashed InstrumentDims) Int)
   }
 
 
@@ -177,7 +179,23 @@ data InstrumentDims = InstrumentDims
   deriving anyclass (Hashable)
 
 
-type DimKey = (InstrumentDims, Attributes)
+{- | Series key.
+
+The instrument half is wrapped in 'Hashed'. Its hash covers the scope, the
+name, the unit, the description, the histogram bounds, and the export key
+set. The hash is computed one time, when the instrument is created. Each
+record hashes only the 'Attributes' half.
+-}
+data DimKey
+  = DimKey
+      {-# UNPACK #-} !(Hashed InstrumentDims)
+      {-# UNPACK #-} !Attributes
+  deriving stock (Eq)
+
+
+instance Hashable DimKey where
+  hashWithSalt s (DimKey d a) = s `hashWithSalt` d `hashWithSalt` a
+  {-# INLINE hashWithSalt #-}
 
 
 data SumCell = SumCell
@@ -187,8 +205,14 @@ data SumCell = SumCell
   }
 
 
+{- | Explicit-bucket histogram cell.
+
+@hcBuckets@ is an unboxed vector, so 'VU.accum' stores an evaluated count.
+A boxed vector stores an @old + 1@ thunk in the bucket on each record. That
+chain of thunks is forced only at collection time.
+-}
 data HistCell = HistCell
-  { hcBuckets :: !(Vector Word64)
+  { hcBuckets :: !(VU.Vector Word64)
   , hcBounds :: !(Vector Double)
   , hcSum :: !Double
   , hcCount :: !Word64
@@ -236,26 +260,48 @@ defaultHistogramBounds =
   V.fromList [0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000]
 
 
-canAcceptNewSeries :: Int -> DimKey -> SdkMeterStorageState -> Bool
-canAcceptNewSeries lim k@(dims, _) st
-  | H.member k (storageCells st) = True
-  | lim <= 0 = True
-  | otherwise = H.lookupDefault 0 dims (seriesCountByDims st) < lim
-
-
 overflowAttributes :: Attributes
 overflowAttributes =
   addAttribute defaultAttributeLimits emptyAttributes (pack "otel.metric.overflow") True
 
 
-overflowKey :: InstrumentDims -> DimKey
-overflowKey dims = (dims, overflowAttributes)
+overflowKey :: Hashed InstrumentDims -> DimKey
+overflowKey dims = DimKey dims overflowAttributes
 
 
-bumpSeriesCount :: InstrumentDims -> H.HashMap InstrumentDims Int -> H.HashMap InstrumentDims Int
+bumpSeriesCount :: Hashed InstrumentDims -> H.HashMap (Hashed InstrumentDims) Int -> H.HashMap (Hashed InstrumentDims) Int
 bumpSeriesCount dims sc =
   let n = H.lookupDefault 0 dims sc
   in H.insert dims (n + 1) sc
+
+
+{- | Insert or update the cell for a series.
+
+The per-instrument cardinality limit applies. When the instrument is at
+the limit and the series is new, the update goes to the overflow series of
+the instrument.
+
+If the series exists, the cost is one 'H.alterF' traversal. A new series
+also does one lookup in the series-count map.
+-}
+upsertCell :: Int -> DimKey -> (Maybe Cell -> Cell) -> SdkMeterStorageState -> SdkMeterStorageState
+upsertCell lim k@(DimKey dims _) mk st =
+  let (isNew, m') = H.alterF (\old -> (isNothingCell old, Just $! mk old)) k (storageCells st)
+  in if isNew
+       then
+         if lim <= 0 || H.lookupDefault 0 dims (seriesCountByDims st) < lim
+           then SdkMeterStorageState m' (bumpSeriesCount dims (seriesCountByDims st))
+           else
+             -- The count is above the limit. Discard the insert above and
+             -- apply the update to the overflow series.
+             let ok = overflowKey dims
+                 (isNewOverflow, mo) = H.alterF (\old -> (isNothingCell old, Just $! mk old)) ok (storageCells st)
+                 sc' = if isNewOverflow then bumpSeriesCount dims (seriesCountByDims st) else seriesCountByDims st
+             in SdkMeterStorageState mo sc'
+       else st {storageCells = m'}
+  where
+    isNothingCell Nothing = True
+    isNothingCell (Just _) = False
 
 
 bucketIndex :: Vector Double -> Double -> Int
@@ -269,7 +315,7 @@ bucketIndex bounds v =
 emptyHist :: Vector Double -> HistCell
 emptyHist bounds =
   HistCell
-    { hcBuckets = V.replicate (V.length bounds + 1) 0
+    { hcBuckets = VU.replicate (V.length bounds + 1) 0
     , hcBounds = bounds
     , hcSum = 0
     , hcCount = 0
@@ -365,14 +411,16 @@ expHistToDataPoint startT t attrs ehc =
        }
 
 
+-- A strict @Maybe@ field forces only the @Just@. The @$!@ forces the
+-- comparison inside it.
 minMaybe :: Maybe Double -> Double -> Maybe Double
 minMaybe Nothing v = Just v
-minMaybe (Just a) v = Just (min a v)
+minMaybe (Just a) v = Just $! min a v
 
 
 maxMaybe :: Maybe Double -> Double -> Maybe Double
 maxMaybe Nothing v = Just v
-maxMaybe (Just a) v = Just (max a v)
+maxMaybe (Just a) v = Just $! max a v
 
 
 validateOrNoop :: Text -> Maybe Text -> IO Bool
@@ -394,17 +442,18 @@ dimsFrom
   -> Maybe Text
   -> Maybe HistogramAggregation
   -> Maybe (HS.HashSet Text)
-  -> InstrumentDims
+  -> Hashed InstrumentDims
 dimsFrom scope name kind mUnit mDesc mh mKeys =
-  InstrumentDims
-    { dimScope = scope
-    , dimName = name
-    , dimKind = kind
-    , dimUnit = fromMaybe mempty mUnit
-    , dimDescription = fromMaybe mempty mDesc
-    , dimHistogramAggregation = mh
-    , dimExportAttributeKeys = mKeys
-    }
+  hashed
+    InstrumentDims
+      { dimScope = scope
+      , dimName = name
+      , dimKind = kind
+      , dimUnit = fromMaybe mempty mUnit
+      , dimDescription = fromMaybe mempty mDesc
+      , dimHistogramAggregation = mh
+      , dimExportAttributeKeys = mKeys
+      }
 
 
 shouldDropInstrument :: [View] -> InstrumentKind -> Text -> Bool
@@ -504,6 +553,10 @@ captureMetricExemplar opts mVal =
             }
 
 
+-- The record functions below update the shared state with
+-- 'casModifyIORef_'. See Note [Evaluated-value CAS] in
+-- "OpenTelemetry.Processor.Batch.Queue" for the reason 'atomicModifyIORef''
+-- is not used.
 addSumInt
   :: Int64
   -> Bool
@@ -516,33 +569,24 @@ addSumInt
 addSumInt delta isMonotonic mExVal k ref lim exOpts = do
   mex <- captureMetricExemplar exOpts mExVal
   let cap = exemplarReservoirLimit exOpts
-  atomicModifyIORef' ref $ \st ->
-    let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
-    in let m = storageCells st
-           scount = seriesCountByDims st
-           newCell = case H.lookup effectiveK m of
-             Nothing ->
-               CsSum $
-                 SumCell
-                   { scValue = Left delta
-                   , scMonotonic = isMonotonic
-                   , scExemplars = maybe V.empty (\e -> pushExemplar cap e V.empty) mex
-                   }
-             Just (CsSum sc) ->
-               CsSum $
-                 sc
-                   { scValue = addEither (scValue sc) (Left delta)
-                   , scExemplars = case mex of
-                       Nothing -> scExemplars sc
-                       Just e -> pushExemplar cap e (scExemplars sc)
-                   }
-             Just _ ->
-               CsSum $
-                 SumCell (Left delta) isMonotonic (maybe V.empty (\e -> pushExemplar cap e V.empty) mex)
-           isNew = not (H.member effectiveK m)
-           m' = H.insert effectiveK newCell m
-           sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-       in (SdkMeterStorageState m' sc', ())
+      fresh =
+        CsSum
+          SumCell
+            { scValue = Left delta
+            , scMonotonic = isMonotonic
+            , scExemplars = maybe V.empty (\e -> pushExemplar cap e V.empty) mex
+            }
+      mk = \case
+        Just (CsSum sc) ->
+          CsSum $!
+            sc
+              { scValue = addEither (scValue sc) (Left delta)
+              , scExemplars = case mex of
+                  Nothing -> scExemplars sc
+                  Just e -> pushExemplar cap e (scExemplars sc)
+              }
+        _ -> fresh
+  casModifyIORef_ ref (upsertCell lim k mk)
 
 
 addSumDbl
@@ -557,46 +601,40 @@ addSumDbl
 addSumDbl delta isMonotonic mExVal k ref lim exOpts = do
   mex <- captureMetricExemplar exOpts mExVal
   let cap = exemplarReservoirLimit exOpts
-  atomicModifyIORef' ref $ \st ->
-    let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
-    in let m = storageCells st
-           scount = seriesCountByDims st
-           newCell = case H.lookup effectiveK m of
-             Nothing ->
-               CsSum $
-                 SumCell
-                   { scValue = Right delta
-                   , scMonotonic = isMonotonic
-                   , scExemplars = maybe V.empty (\e -> pushExemplar cap e V.empty) mex
-                   }
-             Just (CsSum sc) ->
-               CsSum $
-                 sc
-                   { scValue = addEither (scValue sc) (Right delta)
-                   , scExemplars = case mex of
-                       Nothing -> scExemplars sc
-                       Just e -> pushExemplar cap e (scExemplars sc)
-                   }
-             Just _ ->
-               CsSum $
-                 SumCell (Right delta) isMonotonic (maybe V.empty (\e -> pushExemplar cap e V.empty) mex)
-           isNew = not (H.member effectiveK m)
-           m' = H.insert effectiveK newCell m
-           sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-       in (SdkMeterStorageState m' sc', ())
+      fresh =
+        CsSum
+          SumCell
+            { scValue = Right delta
+            , scMonotonic = isMonotonic
+            , scExemplars = maybe V.empty (\e -> pushExemplar cap e V.empty) mex
+            }
+      mk = \case
+        Just (CsSum sc) ->
+          CsSum $!
+            sc
+              { scValue = addEither (scValue sc) (Right delta)
+              , scExemplars = case mex of
+                  Nothing -> scExemplars sc
+                  Just e -> pushExemplar cap e (scExemplars sc)
+              }
+        _ -> fresh
+  casModifyIORef_ ref (upsertCell lim k mk)
 
 
+-- @scValue@ is a strict field, but that forces only the 'Left' or 'Right'
+-- constructor. The @$!@ forces the sum. Without it, each add extends a
+-- chain of thunks that lives until the next collection.
 addEither :: Either Int64 Double -> Either Int64 Double -> Either Int64 Double
-addEither (Left a) (Left b) = Left (a + b)
-addEither (Left a) (Right b) = Right (fromIntegral a + b)
-addEither (Right a) (Left b) = Right (a + fromIntegral b)
-addEither (Right a) (Right b) = Right (a + b)
+addEither (Left a) (Left b) = Left $! a + b
+addEither (Left a) (Right b) = Right $! fromIntegral a + b
+addEither (Right a) (Left b) = Right $! a + fromIntegral b
+addEither (Right a) (Right b) = Right $! a + b
 
 
 mergeHist :: HistCell -> Double -> HistCell
 mergeHist hc v =
   let idx = bucketIndex (hcBounds hc) v
-      b' = V.accum (+) (hcBuckets hc) [(idx, 1)]
+      b' = VU.accum (+) (hcBuckets hc) [(idx, 1)]
       sm = hcSum hc + v
       ct = hcCount hc + 1
   in hc
@@ -623,21 +661,13 @@ recordHist bounds v mExVal k ref lim exOpts = do
     else do
       mex <- captureMetricExemplar exOpts (fmap DoubleNumber mExVal)
       let cap = exemplarReservoirLimit exOpts
-      atomicModifyIORef' ref $ \st ->
-        let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
-        in let m = storageCells st
-               scount = seriesCountByDims st
-               mergeE hc = case mex of
-                 Nothing -> hc
-                 Just e -> hc {hcExemplars = pushExemplar cap e (hcExemplars hc)}
-               newCell = case H.lookup effectiveK m of
-                 Nothing -> CsHist (mergeE (mergeHist (emptyHist bounds) v))
-                 Just (CsHist hc) -> CsHist (mergeE (mergeHist hc v))
-                 Just _ -> CsHist (mergeE (mergeHist (emptyHist bounds) v))
-               isNew = not (H.member effectiveK m)
-               m' = H.insert effectiveK newCell m
-               sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-           in (SdkMeterStorageState m' sc', ())
+          mergeE hc = case mex of
+            Nothing -> hc
+            Just e -> hc {hcExemplars = pushExemplar cap e (hcExemplars hc)}
+          mk = \case
+            Just (CsHist hc) -> CsHist $! mergeE (mergeHist hc v)
+            _ -> CsHist $! mergeE (mergeHist (emptyHist bounds) v)
+      casModifyIORef_ ref (upsertCell lim k mk)
 
 
 recordExpHist
@@ -655,21 +685,13 @@ recordExpHist sc v mExVal k ref lim exOpts = do
     else do
       mex <- captureMetricExemplar exOpts (fmap DoubleNumber mExVal)
       let cap = exemplarReservoirLimit exOpts
-      atomicModifyIORef' ref $ \st ->
-        let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
-        in let m = storageCells st
-               scount = seriesCountByDims st
-               mergeE ehc = case mex of
-                 Nothing -> ehc
-                 Just e -> ehc {ehcExemplars = pushExemplar cap e (ehcExemplars ehc)}
-               newCell = case H.lookup effectiveK m of
-                 Nothing -> CsExpHist (mergeE (mergeExpHist (emptyExpHist sc) v))
-                 Just (CsExpHist ehc) -> CsExpHist (mergeE (mergeExpHist ehc v))
-                 Just _ -> CsExpHist (mergeE (mergeExpHist (emptyExpHist sc) v))
-               isNew = not (H.member effectiveK m)
-               m' = H.insert effectiveK newCell m
-               sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-           in (SdkMeterStorageState m' sc', ())
+          mergeE ehc = case mex of
+            Nothing -> ehc
+            Just e -> ehc {ehcExemplars = pushExemplar cap e (ehcExemplars ehc)}
+          mk = \case
+            Just (CsExpHist ehc) -> CsExpHist $! mergeE (mergeExpHist ehc v)
+            _ -> CsExpHist $! mergeE (mergeExpHist (emptyExpHist sc) v)
+      casModifyIORef_ ref (upsertCell lim k mk)
 
 
 recordGauge
@@ -684,39 +706,21 @@ recordGauge
 recordGauge val t mExVal k ref lim exOpts = do
   mex <- captureMetricExemplar exOpts mExVal
   let cap = exemplarReservoirLimit exOpts
-  atomicModifyIORef' ref $ \st ->
-    let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
-    in let m = storageCells st
-           scount = seriesCountByDims st
-           newGauge gc =
-             case mex of
-               Nothing -> gc {gcValue = val, gcTimeUnixNano = t}
-               Just e ->
-                 gc
-                   { gcValue = val
-                   , gcTimeUnixNano = t
-                   , gcExemplars = pushExemplar cap e (gcExemplars gc)
-                   }
-           newCell = case H.lookup effectiveK m of
-             Nothing ->
-               CsGauge
-                 GaugeCell
-                   { gcValue = val
-                   , gcTimeUnixNano = t
-                   , gcExemplars = maybe V.empty (\e -> pushExemplar cap e V.empty) mex
-                   }
-             Just (CsGauge gc) -> CsGauge (newGauge gc)
-             Just _ ->
-               CsGauge
-                 GaugeCell
-                   { gcValue = val
-                   , gcTimeUnixNano = t
-                   , gcExemplars = maybe V.empty (\e -> pushExemplar cap e V.empty) mex
-                   }
-           isNew = not (H.member effectiveK m)
-           m' = H.insert effectiveK newCell m
-           sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-       in (SdkMeterStorageState m' sc', ())
+      fresh =
+        CsGauge
+          GaugeCell
+            { gcValue = val
+            , gcTimeUnixNano = t
+            , gcExemplars = maybe V.empty (\e -> pushExemplar cap e V.empty) mex
+            }
+      mk = \case
+        Just (CsGauge gc) ->
+          CsGauge $!
+            case mex of
+              Nothing -> gc {gcValue = val, gcTimeUnixNano = t}
+              Just e -> gc {gcValue = val, gcTimeUnixNano = t, gcExemplars = pushExemplar cap e (gcExemplars gc)}
+        _ -> fresh
+  casModifyIORef_ ref (upsertCell lim k mk)
 
 
 resetCellForDelta :: Cell -> Cell
@@ -784,7 +788,7 @@ mkMeter env scope =
               pure $
                 Counter
                   { counterAdd = \n attrs ->
-                      addSumInt n mono (Just (IntNumber n)) (dims, attrs) ref lim exOpts
+                      addSumInt n mono (Just (IntNumber n)) (DimKey dims attrs) ref lim exOpts
                   , counterEnabled = pure True
                   }
             else pure $ Counter (\_ _ -> pure ()) (pure False)
@@ -806,7 +810,7 @@ mkMeter env scope =
               pure $
                 Counter
                   { counterAdd = \v attrs ->
-                      addSumDbl v mono (Just (DoubleNumber v)) (dims, attrs) ref lim exOpts
+                      addSumDbl v mono (Just (DoubleNumber v)) (DimKey dims attrs) ref lim exOpts
                   , counterEnabled = pure True
                   }
             else pure $ Counter (\_ _ -> pure ()) (pure False)
@@ -828,7 +832,7 @@ mkMeter env scope =
               pure $
                 UpDownCounter
                   { upDownCounterAdd = \n attrs ->
-                      addSumInt n False (Just (IntNumber n)) (dims, attrs) ref lim exOpts
+                      addSumInt n False (Just (IntNumber n)) (DimKey dims attrs) ref lim exOpts
                   , upDownCounterEnabled = pure True
                   }
             else pure $ UpDownCounter (\_ _ -> pure ()) (pure False)
@@ -850,7 +854,7 @@ mkMeter env scope =
               pure $
                 UpDownCounter
                   { upDownCounterAdd = \v attrs ->
-                      addSumDbl v False (Just (DoubleNumber v)) (dims, attrs) ref lim exOpts
+                      addSumDbl v False (Just (DoubleNumber v)) (DimKey dims attrs) ref lim exOpts
                   , upDownCounterEnabled = pure True
                   }
             else pure $ UpDownCounter (\_ _ -> pure ()) (pure False)
@@ -877,14 +881,14 @@ mkMeter env scope =
                     pure $
                       Histogram
                         { histogramRecord = \v attrs ->
-                            recordHist bounds v (Just v) (dimsBase, attrs) ref lim exOpts
+                            recordHist bounds v (Just v) (DimKey dimsBase attrs) ref lim exOpts
                         , histogramEnabled = pure True
                         }
                   HistogramAggregationExponential scale ->
                     pure $
                       Histogram
                         { histogramRecord = \v attrs ->
-                            recordExpHist scale v (Just v) (dimsBase, attrs) ref lim exOpts
+                            recordExpHist scale v (Just v) (DimKey dimsBase attrs) ref lim exOpts
                         , histogramEnabled = pure True
                         }
 
@@ -906,7 +910,7 @@ mkMeter env scope =
                 Gauge
                   { gaugeRecord = \n attrs -> do
                       t <- nowNanos
-                      recordGauge (IntNumber n) t (Just (IntNumber n)) (dims, attrs) ref lim exOpts
+                      recordGauge (IntNumber n) t (Just (IntNumber n)) (DimKey dims attrs) ref lim exOpts
                   , gaugeEnabled = pure True
                   }
             else pure $ Gauge (\_ _ -> pure ()) (pure False)
@@ -929,7 +933,7 @@ mkMeter env scope =
                 Gauge
                   { gaugeRecord = \v attrs -> do
                       t <- nowNanos
-                      recordGauge (DoubleNumber v) t (Just (DoubleNumber v)) (dims, attrs) ref lim exOpts
+                      recordGauge (DoubleNumber v) t (Just (DoubleNumber v)) (DimKey dims attrs) ref lim exOpts
                   , gaugeEnabled = pure True
                   }
             else pure $ Gauge (\_ _ -> pure ()) (pure False)
@@ -954,7 +958,7 @@ mkMeter env scope =
               ref = sdkMeterStorage e
               lim = sdkMeterCardinalityLimit e
               res = ObservableResult $ \n attrs ->
-                addSumInt n True (Just (IntNumber n)) (dims, attrs) ref lim exOpts
+                addSumInt n True (Just (IntNumber n)) (DimKey dims attrs) ref lim exOpts
               run = mapM_ ($ res) cbs
           registerCollect run
           en <- obsEnabled KindAsyncCounter name
@@ -981,7 +985,7 @@ mkMeter env scope =
               ref = sdkMeterStorage e
               lim = sdkMeterCardinalityLimit e
               res = ObservableResult $ \v attrs ->
-                addSumDbl v True (Just (DoubleNumber v)) (dims, attrs) ref lim exOpts
+                addSumDbl v True (Just (DoubleNumber v)) (DimKey dims attrs) ref lim exOpts
               run = mapM_ ($ res) cbs
           registerCollect run
           en <- obsEnabled KindAsyncCounter name
@@ -1008,7 +1012,7 @@ mkMeter env scope =
               ref = sdkMeterStorage e
               lim = sdkMeterCardinalityLimit e
               res = ObservableResult $ \n attrs ->
-                addSumInt n False (Just (IntNumber n)) (dims, attrs) ref lim exOpts
+                addSumInt n False (Just (IntNumber n)) (DimKey dims attrs) ref lim exOpts
               run = mapM_ ($ res) cbs
           registerCollect run
           en <- obsEnabled KindAsyncUpDownCounter name
@@ -1035,7 +1039,7 @@ mkMeter env scope =
               ref = sdkMeterStorage e
               lim = sdkMeterCardinalityLimit e
               res = ObservableResult $ \v attrs ->
-                addSumDbl v False (Just (DoubleNumber v)) (dims, attrs) ref lim exOpts
+                addSumDbl v False (Just (DoubleNumber v)) (DimKey dims attrs) ref lim exOpts
               run = mapM_ ($ res) cbs
           registerCollect run
           en <- obsEnabled KindAsyncUpDownCounter name
@@ -1063,7 +1067,7 @@ mkMeter env scope =
               lim = sdkMeterCardinalityLimit e
               res = ObservableResult $ \n attrs -> do
                 t <- nowNanos
-                recordGauge (IntNumber n) t (Just (IntNumber n)) (dims, attrs) ref lim exOpts
+                recordGauge (IntNumber n) t (Just (IntNumber n)) (DimKey dims attrs) ref lim exOpts
               run = mapM_ ($ res) cbs
           registerCollect run
           en <- obsEnabled KindAsyncGauge name
@@ -1091,7 +1095,7 @@ mkMeter env scope =
               lim = sdkMeterCardinalityLimit e
               res = ObservableResult $ \v attrs -> do
                 t <- nowNanos
-                recordGauge (DoubleNumber v) t (Just (DoubleNumber v)) (dims, attrs) ref lim exOpts
+                recordGauge (DoubleNumber v) t (Just (DoubleNumber v)) (DimKey dims attrs) ref lim exOpts
               run = mapM_ ($ res) cbs
           registerCollect run
           en <- obsEnabled KindAsyncGauge name
@@ -1141,8 +1145,9 @@ buildResourceExport res startT t temp m =
   let groups :: H.HashMap (InstrumentationLibrary, Text, InstrumentKind, Text, Text) [(Attributes, Cell, InstrumentDims)]
       groups =
         H.foldrWithKey
-          ( \(dims, attrs) cell acc ->
-              let k = (dimScope dims, dimName dims, dimKind dims, dimUnit dims, dimDescription dims)
+          ( \(DimKey hdims attrs) cell acc ->
+              let dims = unhashed hdims
+                  k = (dimScope dims, dimName dims, dimKind dims, dimUnit dims, dimDescription dims)
               in H.insertWith (++) k [(attrs, cell, dims)] acc
           )
           H.empty
@@ -1225,7 +1230,7 @@ buildMetricExports startT t temp dims series =
                     , histogramDataPointTimeUnixNano = t
                     , histogramDataPointCount = hcCount hc
                     , histogramDataPointSum = hcSum hc
-                    , histogramDataPointBucketCounts = hcBuckets hc
+                    , histogramDataPointBucketCounts = VU.convert (hcBuckets hc)
                     , histogramDataPointExplicitBounds = hcBounds hc
                     , histogramDataPointAttributes = applyDimAttrs d attrs
                     , histogramDataPointMin = hcMin hc

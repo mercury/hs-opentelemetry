@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Performance
+- The batch span processor and the batch log processor no longer make all
+  producer threads wait on one `atomicModifyIORef'`. The enqueue path adds
+  the item to the front of a counted list with an evaluated-value
+  compare-and-swap, and the worker thread does the grouping by
+  instrumentation scope. On an 18-core machine, the aggregate enqueue cost at
+  8 threads went from about 3.9 µs per span to about 0.4 µs per span. The
+  worker is signalled one time per `maxExportBatchSize` items.
+- The metrics record path is 5 to 8 times cheaper on one thread and 14 times
+  cheaper at 16 threads. The instrument half of the series key is hashed one
+  time at instrument creation (`Data.Hashable.Hashed`). One `alterF`
+  traversal replaces the four `HashMap` operations per record. The shared
+  state is updated with an evaluated-value compare-and-swap in place of
+  `atomicModifyIORef'`.
+- Fixed a thunk leak in the metric aggregation cells. Each record left an
+  unevaluated update in the cell: in the running sum of a `SumCell`, and in
+  the bucket counts and the min and max of a histogram cell (the bucket
+  vector was boxed). Residency grew with the number of records between
+  collections. It was 27 MB after 1M counter adds and 77 MB after 1M
+  histogram records. Residency is now constant.
+- `hs-opentelemetry-sdk-bench` and
+  `hs-opentelemetry-sdk-bench-batch-contention` are now benchmark components
+  in the cabal file. The sources were present but could not be built.
+- Removed the `vector-builder` dependency. It was not used.
+- The counter and histogram benchmarks have new cases at 10, 20 and 100
+  attributes.
+
+### Tests
+- New `OpenTelemetry.Processor.BatchSpanSpec`. It covers grouping by scope,
+  order in a scope, export when a batch is full, chunking of large flushes,
+  drop when the queue is full, flush on shutdown, and concurrent producers.
+
 ## 1.0.0.0 - 2026-05-29
 
 ### Spec conformance (1.55.0 audit)
