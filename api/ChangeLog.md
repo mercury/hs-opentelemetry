@@ -22,6 +22,11 @@
 - `addAttributesFromBuilder` builds the batch as a small map and then merges
   it. This is about 25% cheaper from 10 to 100 attributes. GHC can also float
   a static builder out of a call site as a constant map.
+- New `OpenTelemetry.SemanticsConfig.semanticsOptions`. It is the value of
+  `getSemanticsOptions` as a pure constant. `OpenTelemetry.Trace.Core` uses
+  it in place of inline `unsafePerformIO` calls, so the `code.*` attributes
+  for a call site with a static call stack stay a constant that GHC computes
+  one time.
 - The API benchmark has new cases at 10, 20 and 100 attributes. They cover
   sequential `addAttribute` calls, batch `addAttributes` calls, the
   `addAttributes'` builder path, `createSpan` with initial attributes, and

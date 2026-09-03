@@ -293,7 +293,7 @@ import qualified OpenTelemetry.Internal.Trace.Types as Types
 import OpenTelemetry.Propagator (TextMapPropagator)
 import OpenTelemetry.Resource
 import qualified OpenTelemetry.SemanticConventions as SC
-import OpenTelemetry.SemanticsConfig (StabilityOpt (..), codeOption, getSemanticsOptions)
+import OpenTelemetry.SemanticsConfig (StabilityOpt (..), codeOption, semanticsOptions)
 import OpenTelemetry.Trace.Id
 import OpenTelemetry.Trace.Id.Generator
 import OpenTelemetry.Trace.Id.Generator.Dummy
@@ -335,9 +335,10 @@ createSpan
   -}
 createSpan t ctxt n args = liftIO $ do
   !tidInt <- getCurrentThreadId
-  -- The source-location attributes are lazy, as in 'inSpan'. A Dropped span
-  -- does not build them.
-  let opt = codeOption $ unsafePerformIO getSemanticsOptions
+  -- The source-location attributes are a pure, lazy value, as in 'inSpan'.
+  -- A Dropped span does not build them, and GHC can compute them one time
+  -- for a call site with a static stack. See 'semanticsOptions'.
+  let opt = codeOption semanticsOptions
       codeAttrs = if hasCodeAttributes (attributes args) then H.empty else createSpanCodeAttrs opt callStack
   createSpanHelper t ctxt n args codeAttrs tidInt
 {-# INLINE createSpan #-}
@@ -525,7 +526,7 @@ Note: this will return nothing if the call stack is frozen.
 -}
 ownCodeAttributes :: (HasCallStack) => AttributeMap
 ownCodeAttributes =
-  let opt = codeOption $ unsafePerformIO getSemanticsOptions
+  let opt = codeOption semanticsOptions
   in case getCallStack callStack of
        (("ownCodeAttributes", ownCodeCalledAt) : (ownFunction, _ownFunctionCalledAt) : _) ->
          codeAttributes opt ownFunction ownCodeCalledAt
@@ -544,7 +545,7 @@ Note: this will return nothing if the call stack is frozen.
 -}
 callerAttributes :: (HasCallStack) => AttributeMap
 callerAttributes =
-  let opt = codeOption $ unsafePerformIO getSemanticsOptions
+  let opt = codeOption semanticsOptions
   in case getCallStack callStack of
        (("callerAttributes", _callerAttributesCalledAt) : (_ownFunction, ownFunctionCalledAt) : (callerFunction, _) : _) ->
          codeAttributes opt callerFunction ownFunctionCalledAt
@@ -628,7 +629,7 @@ inSpan
   -}
   -> m a
 inSpan t n args m =
-  let opt = codeOption $ unsafePerformIO getSemanticsOptions
+  let opt = codeOption semanticsOptions
       codeAttrs = if hasCodeAttributes (attributes args) then H.empty else callerCodeAttrs opt callStack
   in inSpanInternal t n args codeAttrs (const m)
 {-# INLINE inSpan #-}
@@ -647,7 +648,7 @@ inSpan'
   -> (Span -> m a)
   -> m a
 inSpan' t n args =
-  let opt = codeOption $ unsafePerformIO getSemanticsOptions
+  let opt = codeOption semanticsOptions
       codeAttrs = if hasCodeAttributes (attributes args) then H.empty else callerCodeAttrs opt callStack
   in inSpanInternal t n args codeAttrs
 {-# INLINE inSpan' #-}

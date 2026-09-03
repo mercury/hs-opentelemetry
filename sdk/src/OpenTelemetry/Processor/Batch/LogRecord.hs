@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
 
 module OpenTelemetry.Processor.Batch.LogRecord (
@@ -19,7 +18,7 @@ import qualified Data.Vector as V
 import OpenTelemetry.Internal.Common.Types (ExportResult (..), ShutdownResult (..))
 import OpenTelemetry.Internal.Log.Types
 import OpenTelemetry.Internal.Logging (otelLogWarning)
-import OpenTelemetry.Util (casReadModifyIORef_)
+import OpenTelemetry.Processor.Batch.Queue
 import System.Timeout (timeout)
 
 
@@ -41,37 +40,6 @@ defaultBatchLogRecordProcessorConfig e =
     , batchLogExportTimeoutMillis = 30000
     , batchLogMaxExportBatchSize = 512
     }
-
-
-{- | Log records that wait for export, newest first.
-
-See the 'Pending' type in "OpenTelemetry.Processor.Batch.Span" for the
-reason this is a plain list behind an evaluated-value compare-and-swap.
--}
-data Pending = Pending
-  { pendingCount :: {-# UNPACK #-} !Int
-  , pendingRecords :: ![ReadableLogRecord]
-  }
-
-
-emptyPending :: Pending
-emptyPending = Pending 0 []
-
-
--- | Returns the queue depth after the push, or 'Nothing' if the record was dropped.
-pushPending :: Int -> ReadableLogRecord -> IORef Pending -> IO (Maybe Int)
-pushPending bound lr ref = do
-  old <- casReadModifyIORef_ ref $ \p@(Pending n xs) ->
-    if n >= bound then p else Pending (n + 1) (lr : xs)
-  let !n = pendingCount old
-  pure $! if n >= bound then Nothing else Just (n + 1)
-
-
--- | Take all pending records, oldest first, and make the queue empty, in one atomic step.
-drainPending :: IORef Pending -> IO (Vector ReadableLogRecord)
-drainPending ref = do
-  p <- casReadModifyIORef_ ref (const emptyPending)
-  pure $! V.fromListN (pendingCount p) (reverse (pendingRecords p))
 
 
 data ProcessorMessage = ScheduledFlush | MaxExportFlush | FlushRequested | Shutdown
@@ -111,8 +79,13 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
               Failure _ -> pure res
               Success -> publishBounded rest
 
+  -- The queue is newest first; export wants oldest first.
+  let takeBatch = do
+        Pending n xs <- drainPending batch
+        pure $! V.fromListN n (reverse xs)
+
   let flushQueueImmediately ret = do
-        batchToExport <- drainPending batch
+        batchToExport <- takeBatch
         if V.null batchToExport
           then pure ret
           else do
@@ -135,7 +108,7 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
 
   let workerAction = do
         req <- waiting
-        batchToExport <- drainPending batch
+        batchToExport <- takeBatch
         res <- publishBounded batchToExport
         case req of
           Shutdown -> flushQueueImmediately res

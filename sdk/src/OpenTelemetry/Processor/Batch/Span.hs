@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
 
 -----------------------------------------------------------------------------
@@ -37,9 +36,9 @@ import qualified Data.Vector as V
 import OpenTelemetry.Exporter.Span (SpanExporter)
 import qualified OpenTelemetry.Exporter.Span as SpanExporter
 import OpenTelemetry.Internal.Logging (otelLogWarning)
+import OpenTelemetry.Processor.Batch.Queue
 import OpenTelemetry.Processor.Span
 import OpenTelemetry.Trace.Core
-import OpenTelemetry.Util (casReadModifyIORef_)
 import System.Timeout (timeout)
 
 
@@ -166,51 +165,11 @@ will be incremented.
 --   -- TODO slice and freeze appropriate section
 -- M.slice (gbSectionSize * (r .&. gbSectionMask)
 
-{- | Spans that wait for export, newest first.
-
-Each 'endSpan' adds one span to the front of this list and increments the
-count. That is all the request thread does. The worker thread groups the
-spans by instrumentation scope in 'groupByScope'. The compare-and-swap on
-the request thread is one small allocation and does not hash
-'InstrumentationLibrary'.
--}
-data Pending = Pending
-  { pendingCount :: {-# UNPACK #-} !Int
-  , pendingSpans :: ![ImmutableSpan]
-  }
-
-
-emptyPending :: Pending
-emptyPending = Pending 0 []
-
-
-{- | Push a span, unless the queue is full.
-
-Returns the queue depth after the push, or 'Nothing' if the span was
-dropped.
-
-The push goes through 'casReadModifyIORef_', which stores an evaluated
-value and retries when the swap fails. See 'modifyStorage' in
-"OpenTelemetry.MeterProvider" for the reason 'atomicModifyIORef'' is
-avoided on this path.
--}
-pushPending :: Int -> ImmutableSpan -> IORef Pending -> IO (Maybe Int)
-pushPending bound s ref = do
-  old <- casReadModifyIORef_ ref $ \p@(Pending n xs) ->
-    if n >= bound then p else Pending (n + 1) (s : xs)
-  let !n = pendingCount old
-  pure $! if n >= bound then Nothing else Just (n + 1)
-
-
--- | Take all pending spans and make the queue empty, in one atomic step.
-drainPending :: IORef Pending -> IO [ImmutableSpan]
-drainPending ref = pendingSpans <$> casReadModifyIORef_ ref (const emptyPending)
-
-
 {- | Group a newest-first span list by instrumentation scope.
 
 Spans in each group are in chronological order. Only the worker thread
-calls this function.
+calls this function. The request thread only pushes onto the shared
+'Pending' queue, so it does not hash 'InstrumentationLibrary'.
 -}
 groupByScope :: [ImmutableSpan] -> HashMap InstrumentationLibrary (Vector ImmutableSpan)
 groupByScope spans =
@@ -301,7 +260,7 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
               SpanExporter.Failure _ -> pure res
               SpanExporter.Success -> publishBounded rest
 
-  let takeBatch = groupByScope <$> drainPending batch
+  let takeBatch = groupByScope . pendingItems <$> drainPending batch
 
   let flushQueueImmediately ret = do
         batchToProcess <- takeBatch
