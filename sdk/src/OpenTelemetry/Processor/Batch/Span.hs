@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
 
 -----------------------------------------------------------------------------
@@ -31,16 +32,16 @@ import Control.Monad.IO.Class
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.List (foldl')
 import Data.Vector (Vector)
 import qualified Data.Vector as V
 import OpenTelemetry.Exporter.Span (SpanExporter)
 import qualified OpenTelemetry.Exporter.Span as SpanExporter
 import OpenTelemetry.Internal.Logging (otelLogWarning)
+import OpenTelemetry.Processor.Batch.Queue
 import OpenTelemetry.Processor.Span
 import OpenTelemetry.Trace.Core
 import System.Timeout (timeout)
-import VectorBuilder.Builder as Builder
-import VectorBuilder.Vector as Builder
 
 
 -- | Configurable options for batch exporting frequence and size
@@ -166,40 +167,22 @@ will be incremented.
 --   -- TODO slice and freeze appropriate section
 -- M.slice (gbSectionSize * (r .&. gbSectionMask)
 
-data BoundedMap a = BoundedMap
-  { itemBounds :: !Int
-  , itemMaxExportBounds :: !Int
-  , itemCount :: !Int
-  , itemMap :: HashMap InstrumentationLibrary (Builder.Builder a)
-  }
+{- | Group a newest-first span list by instrumentation scope.
 
-
-boundedMap :: Int -> Int -> BoundedMap a
-boundedMap bounds exportBounds = BoundedMap bounds exportBounds 0 mempty
-
-
-push :: ImmutableSpan -> BoundedMap ImmutableSpan -> Maybe (BoundedMap ImmutableSpan)
-push s m =
-  if itemCount m >= itemBounds m
-    then Nothing
-    else
-      Just $!
-        m
-          { itemCount = itemCount m + 1
-          , itemMap =
-              HashMap.insertWith
-                (<>)
-                (tracerName $ spanTracer s)
-                (Builder.singleton s)
-                $ itemMap m
-          }
-
-
-buildExport :: BoundedMap a -> (BoundedMap a, HashMap InstrumentationLibrary (Vector a))
-buildExport m =
-  ( m {itemCount = 0, itemMap = mempty}
-  , Builder.build <$> itemMap m
-  )
+Spans in each group are in chronological order. Only the worker thread
+calls this function. The request thread only pushes onto the shared
+'Pending' queue, so it does not hash 'InstrumentationLibrary'.
+-}
+groupByScope :: [ImmutableSpan] -> HashMap InstrumentationLibrary (Vector ImmutableSpan)
+groupByScope spans =
+  (\(n, xs) -> V.fromListN n xs)
+    <$> foldl'
+      (\m s -> HashMap.alter (Just . step s) (tracerName (spanTracer s)) m)
+      HashMap.empty
+      spans
+  where
+    step s Nothing = (1 :: Int, [s])
+    step s (Just (n, xs)) = (n + 1, s : xs)
 
 
 data ProcessorMessage = ScheduledFlush | MaxExportFlush | FlushRequested | Shutdown
@@ -238,7 +221,10 @@ data ProcessorMessage = ScheduledFlush | MaxExportFlush | FlushRequested | Shutd
 batchProcessor :: (MonadIO m) => BatchTimeoutConfig -> SpanExporter -> m SpanProcessor
 batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
   unless rtsSupportsBoundThreads $ error "The hs-opentelemetry batch processor does not work without the -threaded GHC flag!"
-  batch <- newIORef $ boundedMap maxQueueSize maxExportBatchSize
+  -- A batch size below 1 is not valid. It would make the chunking loop
+  -- below run forever and the wake-up test divide by zero.
+  let !exportBatchSize = max 1 maxExportBatchSize
+  batch <- newIORef emptyPending
   droppedRef <- newIORef (0 :: Int)
   warnedRef <- newIORef False
   workSignal <- newEmptyTMVarIO
@@ -270,17 +256,19 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
 
   let publishBounded batchMap
         | HashMap.null batchMap = pure SpanExporter.Success
-        | sum (V.length <$> HashMap.elems batchMap) <= maxExportBatchSize =
+        | sum (V.length <$> HashMap.elems batchMap) <= exportBatchSize =
             publish batchMap
         | otherwise = do
-            let (chunk, rest) = splitBatch maxExportBatchSize batchMap
+            let (chunk, rest) = splitBatch exportBatchSize batchMap
             res <- publish chunk
             case res of
               SpanExporter.Failure _ -> pure res
               SpanExporter.Success -> publishBounded rest
 
+  let takeBatch = groupByScope . pendingItems <$> drainPending batch
+
   let flushQueueImmediately ret = do
-        batchToProcess <- atomicModifyIORef' batch buildExport
+        batchToProcess <- takeBatch
         if null batchToProcess
           then pure ret
           else do
@@ -303,7 +291,7 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
 
   let workerAction = do
         req <- waiting
-        batchToProcess <- atomicModifyIORef' batch buildExport
+        batchToProcess <- takeBatch
         res <- publishBounded batchToProcess
 
         case req of
@@ -322,15 +310,19 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
     SpanProcessor
       { spanProcessorOnStart = \_ _ -> pure ()
       , spanProcessorOnEnd = \s -> do
-          (dropped, exportNeeded) <- atomicModifyIORef' batch $ \builder ->
-            case push s builder of
-              Nothing -> (builder, (True, True))
-              Just b' ->
-                if itemCount b' >= itemMaxExportBounds b'
-                  then (b', (False, True))
-                  else (b', (False, False))
-          when dropped $ warnOnDrop droppedRef warnedRef maxQueueSize "BatchSpanProcessor"
-          when exportNeeded $ void $ atomically $ tryPutTMVar workSignal ()
+          mDepth <- pushPending maxQueueSize s batch
+          case mDepth of
+            Nothing -> do
+              warnOnDrop droppedRef warnedRef maxQueueSize "BatchSpanProcessor"
+              void $ atomically $ tryPutTMVar workSignal ()
+            Just depth ->
+              -- Wake the worker one time per full batch. The STM transaction
+              -- costs more than the push and writes to a shared TVar, so a
+              -- wake on each span above the batch size is too expensive.
+              when (depth `rem` exportBatchSize == 0) $
+                void $
+                  atomically $
+                    tryPutTMVar workSignal ()
       , spanProcessorForceFlush = do
           atomically $ putTMVar flushRequestSignal ()
           atomically $ takeTMVar flushDoneSignal

@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
 
 module OpenTelemetry.Processor.Batch.LogRecord (
@@ -13,14 +14,12 @@ import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
-import Data.Vector (Vector)
 import qualified Data.Vector as V
 import OpenTelemetry.Internal.Common.Types (ExportResult (..), ShutdownResult (..))
 import OpenTelemetry.Internal.Log.Types
 import OpenTelemetry.Internal.Logging (otelLogWarning)
+import OpenTelemetry.Processor.Batch.Queue
 import System.Timeout (timeout)
-import VectorBuilder.Builder as Builder
-import VectorBuilder.Vector as Builder
 
 
 data BatchLogRecordProcessorConfig = BatchLogRecordProcessorConfig
@@ -43,36 +42,6 @@ defaultBatchLogRecordProcessorConfig e =
     }
 
 
-data BoundedBuffer = BoundedBuffer
-  { bufBounds :: !Int
-  , bufExportBounds :: !Int
-  , bufCount :: !Int
-  , bufItems :: !(Builder.Builder ReadableLogRecord)
-  }
-
-
-emptyBuffer :: Int -> Int -> BoundedBuffer
-emptyBuffer bounds exportBounds = BoundedBuffer bounds exportBounds 0 mempty
-
-
-pushBuffer :: ReadableLogRecord -> BoundedBuffer -> Maybe BoundedBuffer
-pushBuffer lr buf
-  | bufCount buf >= bufBounds buf = Nothing
-  | otherwise =
-      Just $!
-        buf
-          { bufCount = bufCount buf + 1
-          , bufItems = bufItems buf <> Builder.singleton lr
-          }
-
-
-buildExportBatch :: BoundedBuffer -> (BoundedBuffer, Vector ReadableLogRecord)
-buildExportBatch buf =
-  ( buf {bufCount = 0, bufItems = mempty}
-  , Builder.build (bufItems buf)
-  )
-
-
 data ProcessorMessage = ScheduledFlush | MaxExportFlush | FlushRequested | Shutdown
 
 
@@ -80,7 +49,10 @@ batchLogRecordProcessor :: (MonadIO m) => BatchLogRecordProcessorConfig -> m Log
 batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
   unless rtsSupportsBoundThreads $
     throwIO (userError "The threaded runtime is required for the batch log record processor")
-  batch <- newIORef $ emptyBuffer batchLogMaxQueueSize batchLogMaxExportBatchSize
+  -- A batch size below 1 is not valid. It would make the chunking loop
+  -- below run forever and the wake-up test divide by zero.
+  let !exportBatchSize = max 1 batchLogMaxExportBatchSize
+  batch <- newIORef emptyPending
   droppedRef <- newIORef (0 :: Int)
   warnedRef <- newIORef False
   workSignal <- newEmptyTMVarIO
@@ -101,17 +73,22 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
 
   let publishBounded batchToExport
         | V.null batchToExport = pure Success
-        | V.length batchToExport <= batchLogMaxExportBatchSize =
+        | V.length batchToExport <= exportBatchSize =
             publish batchToExport
         | otherwise = do
-            let (chunk, rest) = V.splitAt batchLogMaxExportBatchSize batchToExport
+            let (chunk, rest) = V.splitAt exportBatchSize batchToExport
             res <- publish chunk
             case res of
               Failure _ -> pure res
               Success -> publishBounded rest
 
+  -- The queue is newest first; export wants oldest first.
+  let takeBatch = do
+        Pending n xs <- drainPending batch
+        pure $! V.fromListN n (reverse xs)
+
   let flushQueueImmediately ret = do
-        batchToExport <- atomicModifyIORef' batch buildExportBatch
+        batchToExport <- takeBatch
         if V.null batchToExport
           then pure ret
           else do
@@ -134,7 +111,7 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
 
   let workerAction = do
         req <- waiting
-        batchToExport <- atomicModifyIORef' batch buildExportBatch
+        batchToExport <- takeBatch
         res <- publishBounded batchToExport
         case req of
           Shutdown -> flushQueueImmediately res
@@ -150,15 +127,16 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
     LogRecordProcessor
       { logRecordProcessorOnEmit = \lr _ctxt -> do
           readable <- mkReadableLogRecord lr
-          (dropped, exportNeeded) <- atomicModifyIORef' batch $ \buf ->
-            case pushBuffer readable buf of
-              Nothing -> (buf, (True, True))
-              Just b' ->
-                if bufCount b' >= bufExportBounds b'
-                  then (b', (False, True))
-                  else (b', (False, False))
-          when dropped $ warnOnDrop droppedRef warnedRef batchLogMaxQueueSize "BatchLogRecordProcessor"
-          when exportNeeded $ void $ atomically $ tryPutTMVar workSignal ()
+          mDepth <- pushPending batchLogMaxQueueSize readable batch
+          case mDepth of
+            Nothing -> do
+              warnOnDrop droppedRef warnedRef batchLogMaxQueueSize "BatchLogRecordProcessor"
+              void $ atomically $ tryPutTMVar workSignal ()
+            Just depth ->
+              when (depth `rem` exportBatchSize == 0) $
+                void $
+                  atomically $
+                    tryPutTMVar workSignal ()
       , logRecordProcessorForceFlush = do
           atomically $ putTMVar flushRequestSignal ()
           atomically $ takeTMVar flushDoneSignal

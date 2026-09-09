@@ -71,6 +71,7 @@ library
       OpenTelemetry.Trace
       OpenTelemetry.Trace.Id.Generator.Default
   other-modules:
+      OpenTelemetry.Processor.Batch.Queue
       OpenTelemetry.Resource.Detector.Internal
       Paths_hs_opentelemetry_sdk
   reexported-modules:
@@ -137,7 +138,6 @@ library
     , unix-compat >=0.7.1
     , unordered-containers
     , vector
-    , vector-builder
     , yaml
   default-language: Haskell2010
   if os(windows)
@@ -172,6 +172,7 @@ test-suite hs-opentelemetry-sdk-test
       OpenTelemetry.LogSpec
       OpenTelemetry.MeterProviderSpec
       OpenTelemetry.MetricReaderSpec
+      OpenTelemetry.Processor.BatchSpanSpec
       OpenTelemetry.Resource.DetectorSpec
       OpenTelemetry.ResourceSpec
       OpenTelemetry.Trace.CallStackSpec
@@ -196,6 +197,36 @@ test-suite hs-opentelemetry-sdk-test
     , process
     , text
     , unix
+    , unordered-containers
+    , vector
+  default-language: Haskell2010
+
+benchmark hs-opentelemetry-sdk-bench
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  hs-source-dirs:
+      bench
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N -O2
+  build-depends:
+      base >=4.7 && <5
+    , hs-opentelemetry-api
+    , hs-opentelemetry-sdk
+    , tasty-bench
+    , text
+    , unordered-containers
+  default-language: Haskell2010
+
+benchmark hs-opentelemetry-sdk-bench-batch-contention
+  type: exitcode-stdio-1.0
+  main-is: BatchContention.hs
+  hs-source-dirs:
+      bench
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N -O2
+  build-depends:
+      async
+    , base >=4.7 && <5
+    , hs-opentelemetry-api
+    , hs-opentelemetry-sdk
     , unordered-containers
     , vector
   default-language: Haskell2010

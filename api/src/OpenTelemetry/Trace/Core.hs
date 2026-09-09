@@ -293,7 +293,7 @@ import qualified OpenTelemetry.Internal.Trace.Types as Types
 import OpenTelemetry.Propagator (TextMapPropagator)
 import OpenTelemetry.Resource
 import qualified OpenTelemetry.SemanticConventions as SC
-import OpenTelemetry.SemanticsConfig (StabilityOpt (..), codeOption, getSemanticsOptions)
+import OpenTelemetry.SemanticsConfig (StabilityOpt (..), codeOption, semanticsOptions)
 import OpenTelemetry.Trace.Id
 import OpenTelemetry.Trace.Id.Generator
 import OpenTelemetry.Trace.Id.Generator.Dummy
@@ -333,8 +333,31 @@ createSpan
   Try and infer source code information unless the user has set any of the attributes already, which
   we take as an indication that our automatic strategy won't work well.
   -}
-createSpan t ctxt n args = createSpanWithoutCallStack t ctxt n (addAttributesToSpanArgumentsIfNonePresent callerAttributes args)
+createSpan t ctxt n args = liftIO $ do
+  !tidInt <- getCurrentThreadId
+  -- The source-location attributes are a pure, lazy value, as in 'inSpan'.
+  -- A Dropped span does not build them, and GHC can compute them one time
+  -- for a call site with a static stack. See 'semanticsOptions'.
+  let opt = codeOption semanticsOptions
+      codeAttrs = if hasCodeAttributes (attributes args) then H.empty else createSpanCodeAttrs opt callStack
+  createSpanHelper t ctxt n args codeAttrs tidInt
 {-# INLINE createSpan #-}
+
+
+{- | Source-location attributes for 'createSpan'.
+
+The top frame of the stack must be the @createSpan@ frame. This is the same
+rule that 'callerAttributes' applied when 'createSpan' called it directly.
+'GHC.Stack.withFrozenCallStack' does not push that frame, so the result is
+empty. That is the documented way to turn off the automatic @code.*@
+attributes.
+-}
+createSpanCodeAttrs :: StabilityOpt -> CallStack -> AttributeMap
+createSpanCodeAttrs opt cs = case getCallStack cs of
+  (("createSpan", callSite) : (callerFn, _) : _) -> codeAttributes opt callerFn callSite
+  (("createSpan", callSite) : _) -> codeAttributes opt "<unknown>" callSite
+  _ -> H.empty
+{-# INLINE createSpanCodeAttrs #-}
 
 
 {- | The same thing as 'createSpan', except that it does not have a 'HasCallStack' constraint.
@@ -503,7 +526,7 @@ Note: this will return nothing if the call stack is frozen.
 -}
 ownCodeAttributes :: (HasCallStack) => AttributeMap
 ownCodeAttributes =
-  let opt = codeOption $ unsafePerformIO getSemanticsOptions
+  let opt = codeOption semanticsOptions
   in case getCallStack callStack of
        (("ownCodeAttributes", ownCodeCalledAt) : (ownFunction, _ownFunctionCalledAt) : _) ->
          codeAttributes opt ownFunction ownCodeCalledAt
@@ -522,7 +545,7 @@ Note: this will return nothing if the call stack is frozen.
 -}
 callerAttributes :: (HasCallStack) => AttributeMap
 callerAttributes =
-  let opt = codeOption $ unsafePerformIO getSemanticsOptions
+  let opt = codeOption semanticsOptions
   in case getCallStack callStack of
        (("callerAttributes", _callerAttributesCalledAt) : (_ownFunction, ownFunctionCalledAt) : (callerFunction, _) : _) ->
          codeAttributes opt callerFunction ownFunctionCalledAt
@@ -556,18 +579,6 @@ codeAttributes opt fn loc = case opt of
 -}
 addAttributesToSpanArguments :: AttributeMap -> SpanArguments -> SpanArguments
 addAttributesToSpanArguments attrs args = args {attributes = H.union (attributes args) attrs}
-
-
--- | Add the given attributes to the span arguments, but only if *none* of them are present already.
-addAttributesToSpanArgumentsIfNonePresent :: AttributeMap -> SpanArguments -> SpanArguments
-addAttributesToSpanArgumentsIfNonePresent attrs args
-  | H.null attrs = args
-  | H.null existingAttrs = addAttributesToSpanArguments attrs args
-  | anyOverlap = args
-  | otherwise = addAttributesToSpanArguments attrs args
-  where
-    existingAttrs = attributes args
-    anyOverlap = any (`H.member` existingAttrs) (H.keys attrs)
 
 
 hasCodeAttributes :: AttributeMap -> Bool
@@ -618,7 +629,7 @@ inSpan
   -}
   -> m a
 inSpan t n args m =
-  let opt = codeOption $ unsafePerformIO getSemanticsOptions
+  let opt = codeOption semanticsOptions
       codeAttrs = if hasCodeAttributes (attributes args) then H.empty else callerCodeAttrs opt callStack
   in inSpanInternal t n args codeAttrs (const m)
 {-# INLINE inSpan #-}
@@ -637,7 +648,7 @@ inSpan'
   -> (Span -> m a)
   -> m a
 inSpan' t n args =
-  let opt = codeOption $ unsafePerformIO getSemanticsOptions
+  let opt = codeOption semanticsOptions
       codeAttrs = if hasCodeAttributes (attributes args) then H.empty else callerCodeAttrs opt callStack
   in inSpanInternal t n args codeAttrs
 {-# INLINE inSpan' #-}
@@ -761,9 +772,12 @@ addAttribute (Dropped _) _ _ = pure ()
 {-# SPECIALIZE OpenTelemetry.Trace.Core.addAttribute :: (A.ToAttribute a) => Span -> Text -> a -> IO () #-}
 
 
-{- | A convenience function related to 'addAttribute' that adds multiple attributes to a span at the same time.
+{- | Add several attributes to a span in one update.
 
- This function may be slightly more performant than repeatedly calling 'addAttribute'.
+This function does one compare-and-swap on the span and one merge of the
+map. A sequence of 'addAttribute' calls costs about 10 times more at 20
+attributes and 15 times more at 100. Use this function when the attributes
+are already in a map.
 
  @since 0.0.1.0
 -}
@@ -774,7 +788,7 @@ addAttributes (Span imm) attrs = liftIO $ casModifyIORef_ (spanHot imm) $ \(!h) 
     else
       h
         { hotAttributes =
-            OpenTelemetry.Attributes.addAttributes
+            A.addAttributeMap
               (tracerSpanAttributeLimits $ spanTracer imm)
               (hotAttributes h)
               attrs
@@ -788,7 +802,11 @@ addAttributes (Dropped _) _ = pure ()
 
 
 {- | Like 'addAttributes', but takes an 'A.AttrsBuilder' instead of a 'HashMap'.
-More efficient when setting many attributes at once.
+
+Use this function when the attributes come from typed keys or are optional.
+For up to about 5 attributes the cost is the same as 'addAttributes'. For
+larger batches, 'addAttributes' with a prepared map is faster, because the
+builder inserts one key at a time.
 
 With typed 'AttributeKey's from semantic conventions:
 
@@ -851,7 +869,7 @@ addEvent (Span imm) NewEvent {..} = liftIO $ do
                 Event
                   { eventName = newEventName
                   , eventAttributes =
-                      A.addAttributes
+                      A.addAttributeMap
                         (tracerEventAttributeLimits $ spanTracer imm)
                         emptyAttributes
                         newEventAttributes
@@ -910,7 +928,7 @@ freezeLink :: Tracer -> NewLink -> Link
 freezeLink t NewLink {..} =
   Link
     { frozenLinkContext = linkContext
-    , frozenLinkAttributes = A.addAttributes (tracerLinkAttributeLimits t) A.emptyAttributes linkAttributes
+    , frozenLinkAttributes = A.addAttributeMap (tracerLinkAttributeLimits t) A.emptyAttributes linkAttributes
     }
 
 
