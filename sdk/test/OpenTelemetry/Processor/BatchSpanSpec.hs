@@ -131,6 +131,19 @@ spec = describe "BatchSpanProcessor" $ do
     let n = totalSpans batches
     n `shouldSatisfy` (\x -> x >= 16 && x < 40)
 
+  it "treats a batch size below 1 as 1" $ do
+    -- OTEL_BSP_MAX_EXPORT_BATCH_SIZE=0 reaches the processor without a
+    -- check. It must not divide by zero on the request thread or loop
+    -- forever in the worker.
+    (exporter, ref) <- recordingExporter
+    withProvider quietConfig {maxExportBatchSize = 0} exporter $ \tp -> do
+      let t = makeTracer tp (instrumentationLibrary "lib" "1") tracerOptions
+      replicateM_ 5 $ inSpan'' t "s" defaultSpanArguments (\_ -> pure ())
+      void $ forceFlushTracerProvider tp Nothing
+    batches <- exportedSpans ref
+    totalSpans batches `shouldBe` 5
+    forM_ batches $ \b -> sum (map V.length (HM.elems b)) `shouldBe` 1
+
   it "flushes everything on shutdown" $ do
     (exporter, ref) <- recordingExporter
     withProvider quietConfig exporter $ \tp -> do

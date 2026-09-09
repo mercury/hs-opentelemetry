@@ -6,7 +6,11 @@
 - `createSpan` does not build the `code.*` attributes for a Dropped span.
   The source-location attributes are now lazy, as they are in `inSpan`.
   `createSpan` on a no-op tracer went from 168 ns and 815 B to 10 ns and
-  0 B. The `withFrozenCallStack` opt-out still works.
+  0 B. The `withFrozenCallStack` opt-out still works. `createSpan` now uses
+  the same test as `inSpan` to decide if user-supplied `code.*` attributes
+  turn off the automatic ones: any of `code.function`, `code.namespace`,
+  `code.filepath`, `code.function.name`, or `code.file.path` in
+  `SpanArguments` does.
 - `addAttributes` merges the batch with `HashMap.union`. Before, it inserted
   each key of the batch into the live map one at a time. That was O(n log n)
   and copied a path through the map for each key, also when the base map was

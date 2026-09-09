@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
 
 -----------------------------------------------------------------------------
@@ -31,6 +32,7 @@ import Control.Monad.IO.Class
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.List (foldl')
 import Data.Vector (Vector)
 import qualified Data.Vector as V
 import OpenTelemetry.Exporter.Span (SpanExporter)
@@ -219,6 +221,9 @@ data ProcessorMessage = ScheduledFlush | MaxExportFlush | FlushRequested | Shutd
 batchProcessor :: (MonadIO m) => BatchTimeoutConfig -> SpanExporter -> m SpanProcessor
 batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
   unless rtsSupportsBoundThreads $ error "The hs-opentelemetry batch processor does not work without the -threaded GHC flag!"
+  -- A batch size below 1 is not valid. It would make the chunking loop
+  -- below run forever and the wake-up test divide by zero.
+  let !exportBatchSize = max 1 maxExportBatchSize
   batch <- newIORef emptyPending
   droppedRef <- newIORef (0 :: Int)
   warnedRef <- newIORef False
@@ -251,10 +256,10 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
 
   let publishBounded batchMap
         | HashMap.null batchMap = pure SpanExporter.Success
-        | sum (V.length <$> HashMap.elems batchMap) <= maxExportBatchSize =
+        | sum (V.length <$> HashMap.elems batchMap) <= exportBatchSize =
             publish batchMap
         | otherwise = do
-            let (chunk, rest) = splitBatch maxExportBatchSize batchMap
+            let (chunk, rest) = splitBatch exportBatchSize batchMap
             res <- publish chunk
             case res of
               SpanExporter.Failure _ -> pure res
@@ -314,7 +319,7 @@ batchProcessor BatchTimeoutConfig {..} exporter = liftIO $ do
               -- Wake the worker one time per full batch. The STM transaction
               -- costs more than the push and writes to a shared TVar, so a
               -- wake on each span above the batch size is too expensive.
-              when (depth `rem` maxExportBatchSize == 0) $
+              when (depth `rem` exportBatchSize == 0) $
                 void $
                   atomically $
                     tryPutTMVar workSignal ()

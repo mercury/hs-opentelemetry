@@ -12,8 +12,9 @@
   worker is signalled one time per `maxExportBatchSize` items.
 - The metrics record path is 5 to 8 times cheaper on one thread and 14 times
   cheaper at 16 threads. The instrument half of the series key is hashed one
-  time at instrument creation (`Data.Hashable.Hashed`). One `alterF`
-  traversal replaces the four `HashMap` operations per record. The shared
+  time at instrument creation (`Data.Hashable.Hashed`). One `alterF` call,
+  which hashes the key one time, replaces four `HashMap` operations that
+  each hashed the key. The shared
   state is updated with an evaluated-value compare-and-swap in place of
   `atomicModifyIORef'`.
 - Fixed a thunk leak in the metric aggregation cells. Each record left an

@@ -281,8 +281,8 @@ The per-instrument cardinality limit applies. When the instrument is at
 the limit and the series is new, the update goes to the overflow series of
 the instrument.
 
-If the series exists, the cost is one 'H.alterF' traversal. A new series
-also does one lookup in the series-count map.
+'H.alterF' hashes the key one time, then does a lookup and an insert. A
+new series also does one lookup in the series-count map.
 -}
 upsertCell :: Int -> DimKey -> (Maybe Cell -> Cell) -> SdkMeterStorageState -> SdkMeterStorageState
 upsertCell lim k@(DimKey dims _) mk st =

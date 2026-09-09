@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
 
 module OpenTelemetry.Processor.Batch.LogRecord (
@@ -13,7 +14,6 @@ import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
-import Data.Vector (Vector)
 import qualified Data.Vector as V
 import OpenTelemetry.Internal.Common.Types (ExportResult (..), ShutdownResult (..))
 import OpenTelemetry.Internal.Log.Types
@@ -49,6 +49,9 @@ batchLogRecordProcessor :: (MonadIO m) => BatchLogRecordProcessorConfig -> m Log
 batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
   unless rtsSupportsBoundThreads $
     throwIO (userError "The threaded runtime is required for the batch log record processor")
+  -- A batch size below 1 is not valid. It would make the chunking loop
+  -- below run forever and the wake-up test divide by zero.
+  let !exportBatchSize = max 1 batchLogMaxExportBatchSize
   batch <- newIORef emptyPending
   droppedRef <- newIORef (0 :: Int)
   warnedRef <- newIORef False
@@ -70,10 +73,10 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
 
   let publishBounded batchToExport
         | V.null batchToExport = pure Success
-        | V.length batchToExport <= batchLogMaxExportBatchSize =
+        | V.length batchToExport <= exportBatchSize =
             publish batchToExport
         | otherwise = do
-            let (chunk, rest) = V.splitAt batchLogMaxExportBatchSize batchToExport
+            let (chunk, rest) = V.splitAt exportBatchSize batchToExport
             res <- publish chunk
             case res of
               Failure _ -> pure res
@@ -130,7 +133,7 @@ batchLogRecordProcessor BatchLogRecordProcessorConfig {..} = liftIO $ do
               warnOnDrop droppedRef warnedRef batchLogMaxQueueSize "BatchLogRecordProcessor"
               void $ atomically $ tryPutTMVar workSignal ()
             Just depth ->
-              when (depth `rem` batchLogMaxExportBatchSize == 0) $
+              when (depth `rem` exportBatchSize == 0) $
                 void $
                   atomically $
                     tryPutTMVar workSignal ()
